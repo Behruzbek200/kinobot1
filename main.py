@@ -1027,17 +1027,16 @@ def register_builder_handlers(bot: telebot.TeleBot):
 
 def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
-    def check_sub(user_id: int) -> Tuple[bool, List]:
+      def check_sub(user_id: int) -> Tuple[bool, List]:
         """
-        HAR SAFAR tekshiradi (cache yo'q).
-        Faqat PUBLIC kanallar qat'iy tekshiriladi.
-        External va Private kanallar avtomatik 'obuna bo'lgan' deb hisoblanadi
-        (chunki ularni get_chat_member bilan tekshirib bo'lmaydi).
+        Har safar tekshiradi (cache yo'q).
+        - Public kanal: @username yoki chat_id orqali
+        - Private kanal: chat_id orqali (bot ADMIN bo'lishi shart!)
+        - External/link: tekshirib bo'lmaydi — o'tkazib yuboriladi
         """
         if not get_setting(bot_id, "forced_sub_enabled", 1):
             return True, []
 
-        # Kanallar ro'yxatini cache'dan olamiz (bu xavfsiz — kanallar kam o'zgaradi)
         ck = f"chs:{bot_id}"
         channels = cache_get(ck)
         if channels is None:
@@ -1053,39 +1052,39 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             return True, []
 
         show_list = []
-        public_missing = False
+        missing_any = False
 
         for ch in channels:
             ctype = (ch["channel_type"] or "public").lower()
 
-            # External va Private kanallarni tekshirmaymiz — ular doim "obuna" hisoblanadi
-            # Chunki get_chat_member ular uchun ishlamaydi
-            if ctype in ("external", "link", "private"):
+            # External/link — tekshirib bo'lmaydi, o'tkazib yuboramiz
+            if ctype in ("external", "link"):
                 continue
 
-            # Faqat PUBLIC kanallar tekshiriladi
+            # Chat ID ni aniqlash
             chat_id = ch["chat_id"]
             if not chat_id and ch["username"]:
                 chat_id = "@" + ch["username"].lstrip("@")
 
+            if not chat_id:
+                # chat_id ham, username ham yo'q — o'tkazib yuboramiz
+                continue
+
             subscribed = False
-            if chat_id:
-                try:
-                    member = bot.get_chat_member(chat_id, user_id)
-                    if member.status not in ("left", "kicked"):
-                        subscribed = True
-                except Exception as e:
-                    # Agar API xatolik bersa — obuna emas deb hisoblaymiz
-                    print(f"check_sub API error for {chat_id}: {e}")
-                    subscribed = False
+            try:
+                member = bot.get_chat_member(chat_id, user_id)
+                if member.status not in ("left", "kicked"):
+                    subscribed = True
+            except Exception as e:
+                # Agar bot admin bo'lmasa yoki kanal topilmasa — xatolik
+                print(f"check_sub error ({chat_id}): {e}")
+                subscribed = False
 
             if not subscribed:
-                public_missing = True
+                missing_any = True
                 show_list.append(ch)
 
-        ok = not public_missing
-        return ok, show_list
-
+        return (not missing_any), show_list
     def show_forced_sub(chat_id: int, user_id: int, missing: List, edit_msg_id=None):
         text = "📢 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
         mk = types.InlineKeyboardMarkup(row_width=1)
