@@ -5,6 +5,7 @@ Kino Bot Builder - Professional Telegram Bot System
 Python 3.12+ + PyTelegramBotAPI + Flask webhook + Supabase PostgreSQL
 Optimized for Render.com
 Majburiy obuna: HAR BIR tugmada doimiy tekshiriladi (public + private)
+Maxfiy kanal: join request avtomatik tasdiqlanadi
 """
 
 import os
@@ -539,7 +540,11 @@ def start_movie_bot(bot_id: int) -> bool:
             try:
                 bot.remove_webhook()
                 time.sleep(0.3)
-                bot.set_webhook(url=wh)
+                # chat_join_request ni ham qabul qilish uchun allowed_updates
+                bot.set_webhook(
+                    url=wh,
+                    allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"]
+                )
                 print(f"[Bot {bot_id}] webhook set: {wh}")
             except Exception as e:
                 print(f"[Bot {bot_id}] webhook error: {e}")
@@ -1067,7 +1072,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 chat_id = "@" + ch["username"].lstrip("@")
 
             if not chat_id:
-                # chat_id ham, username ham yo'q — o'tkazib yuboramiz
                 continue
 
             subscribed = False
@@ -1076,7 +1080,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 if member.status not in ("left", "kicked"):
                     subscribed = True
             except Exception as e:
-                # Xatolik — bot admin emas yoki kanal topilmadi
                 print(f"check_sub error ({chat_id}): {e}")
                 subscribed = False
 
@@ -1100,6 +1103,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 mk.add(types.InlineKeyboardButton(btn_text, url=url))
             else:
                 text += f"• {icon} {title}\n"
+        text += "\n<i>Maxfiy kanalga qo'shilish so'rovini yuborganingizdan so'ng bot avtomatik tasdiqlaydi. So'ng «Tekshirish» ni bosing.</i>"
         mk.add(types.InlineKeyboardButton("🔄 Tekshirish", callback_data=f"u:checksub:{bot_id}"))
         try:
             if edit_msg_id:
@@ -1145,6 +1149,55 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         except Exception as e:
             print(f"m_start error: {e}\n{traceback.format_exc()}")
 
+    # ============ AVTOMATIK JOIN REQUEST TASDIQLASH ============
+    @bot.chat_join_request_handler(func=lambda r: True)
+    def auto_approve_join(request: types.ChatJoinRequest):
+        """Foydalanuvchi kanalga qo'shilish so'rovini avtomatik tasdiqlaydi."""
+        try:
+            chat_id = request.chat.id
+            user_id = request.from_user.id
+            print(f"[Join Request] Received: user={user_id}, chat={chat_id}, chat_type={request.chat.type}")
+
+            # Kanallar ro'yxatini tekshiramiz
+            ck = f"chs:{bot_id}"
+            channels = cache_get(ck)
+            if channels is None:
+                with db() as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as c:
+                        c.execute(
+                            "SELECT * FROM channels WHERE bot_id=%s AND is_active=1", (bot_id,)
+                        )
+                        channels = [dict(r) for r in c.fetchall()]
+                cache_set(ck, channels)
+
+            is_our_channel = False
+            for ch in channels:
+                if ch["chat_id"] and str(chat_id) == str(ch["chat_id"]):
+                    is_our_channel = True
+                    break
+
+            if not is_our_channel:
+                print(f"[Join Request] Not our channel: {chat_id}")
+                return
+
+            # So'rovni tasdiqlaymiz
+            try:
+                bot.approve_chat_join_request(chat_id, user_id)
+                print(f"[Join Request] ✅ Approved: user={user_id}, chat={chat_id}")
+            except Exception as e:
+                print(f"[Join Request] approve error: {e}")
+
+            # Foydalanuvchiga xabar
+            try:
+                bot.send_message(
+                    user_id,
+                    "✅ Kanalga qo'shildingiz! Endi /start buyrug'ini bosing."
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"auto_approve_join error: {e}\n{traceback.format_exc()}")
+
     @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith(("u:", "a:")))
     def m_callback(c: types.CallbackQuery):
         try:
@@ -1156,7 +1209,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             msg_id = c.message.message_id
 
             # ============ MAJBURIY OBUNA — HAR BIR TUGMADA ============
-            # a: (admin) va u:checksub: bundan mustasno
             if not data.startswith("a:") and not data.startswith("u:checksub:"):
                 ok, show_list = check_sub(uid)
                 if not ok:
@@ -2184,7 +2236,10 @@ def setup_webhooks():
         builder_bot.remove_webhook()
         time.sleep(0.5)
         url = f"{base.rstrip('/')}/webhook/builder"
-        builder_bot.set_webhook(url=url)
+        builder_bot.set_webhook(
+            url=url,
+            allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"]
+        )
         print(f"✅ Builder webhook: {url}")
     except Exception as e:
         print(f"Builder webhook set error: {e}")
