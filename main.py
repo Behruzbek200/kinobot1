@@ -1027,7 +1027,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
 
 def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
-      def check_sub(user_id: int) -> Tuple[bool, List]:
+def check_sub(user_id: int) -> Tuple[bool, List]:
         """
         Har safar tekshiradi (cache yo'q).
         - Public kanal: @username yoki chat_id orqali
