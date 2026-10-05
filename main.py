@@ -4,7 +4,7 @@
 Kino Bot Builder - Professional Telegram Bot System
 Python 3.12+ + PyTelegramBotAPI + Flask webhook + Supabase PostgreSQL
 Optimized for Render.com
-Majburiy obuna: HAR BIR tugma va xabarda doimiy tekshiriladi
+Majburiy obuna: HAR BIR tugmada doimiy tekshiriladi (public + private)
 """
 
 import os
@@ -1026,7 +1026,8 @@ def register_builder_handlers(bot: telebot.TeleBot):
 # ==================== MOVIE BOT HANDLERS ====================
 
 def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
-        def check_sub(user_id: int) -> Tuple[bool, List]:
+
+    def check_sub(user_id: int) -> Tuple[bool, List]:
         """
         Har safar tekshiradi (cache yo'q).
         - Public kanal: @username yoki chat_id orqali
@@ -1075,7 +1076,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 if member.status not in ("left", "kicked"):
                     subscribed = True
             except Exception as e:
-                # Agar bot admin bo'lmasa yoki kanal topilmasa — xatolik
+                # Xatolik — bot admin emas yoki kanal topilmadi
                 print(f"check_sub error ({chat_id}): {e}")
                 subscribed = False
 
@@ -1084,6 +1085,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 show_list.append(ch)
 
         return (not missing_any), show_list
+
     def show_forced_sub(chat_id: int, user_id: int, missing: List, edit_msg_id=None):
         text = "📢 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
         mk = types.InlineKeyboardMarkup(row_width=1)
@@ -1544,7 +1546,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         r = cur.fetchone()
                 if not r:
                     return
-                text = f"📢 {r['title'] or r['username']}\nTuri: {r['channel_type']}\nURL: {r['url'] or '-'}"
+                text = f"📢 {r['title'] or r['username']}\nTuri: {r['channel_type']}\nChat ID: {r['chat_id'] or '-'}\nURL: {r['url'] or '-'}"
                 mk = types.InlineKeyboardMarkup()
                 mk.add(types.InlineKeyboardButton("🗑 O'chirish", callback_data=f"a:chdel:{bot_id}:{cid}"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:chs:{bot_id}:0"))
@@ -1563,6 +1565,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM channels WHERE channel_id=%s AND bot_id=%s", (cid, bot_id))
+                cache_del_prefix(f"chs:{bot_id}")
                 bot.edit_message_text("✅ O'chirildi", chat_id, msg_id, reply_markup=kb_back(f"a:chs:{bot_id}:0"))
 
             elif data.startswith("a:plans:"):
@@ -1732,7 +1735,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         state, data = get_state(bot_id, uid)
         try:
             # ============ MAJBURIY OBUNA — MATNLI XABARLARDA ============
-            # Faqat foydalanuvchi holatlari uchun (admin holatlari emas)
             user_states = ("search", "premium_amount", "premium_check", "pay_check")
             if state in user_states:
                 ok, show_list = check_sub(uid)
