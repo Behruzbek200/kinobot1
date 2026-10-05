@@ -4,6 +4,7 @@
 Kino Bot Builder - Professional Telegram Bot System
 Python 3.12+ + PyTelegramBotAPI + Flask webhook + Supabase PostgreSQL
 Optimized for Render.com
+Majburiy obuna: HAR BIR tugma va xabarda doimiy tekshiriladi
 """
 
 import os
@@ -1026,13 +1027,17 @@ def register_builder_handlers(bot: telebot.TeleBot):
 
 def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
-    def check_sub(user_id: int, force: bool = False) -> Tuple[bool, List]:
+    def check_sub(user_id: int) -> Tuple[bool, List]:
+        """
+        HAR SAFAR tekshiradi (cache yo'q).
+        Faqat PUBLIC kanallar qat'iy tekshiriladi.
+        External va Private kanallar avtomatik 'obuna bo'lgan' deb hisoblanadi
+        (chunki ularni get_chat_member bilan tekshirib bo'lmaydi).
+        """
         if not get_setting(bot_id, "forced_sub_enabled", 1):
             return True, []
-        sub_ck = f"subok:{bot_id}:{user_id}"
-        if not force:
-            if cache_get(sub_ck) is True:
-                return True, []
+
+        # Kanallar ro'yxatini cache'dan olamiz (bu xavfsiz — kanallar kam o'zgaradi)
         ck = f"chs:{bot_id}"
         channels = cache_get(ck)
         if channels is None:
@@ -1043,41 +1048,46 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                     )
                     channels = [dict(r) for r in c.fetchall()]
             cache_set(ck, channels)
+
         if not channels:
-            cache_set(sub_ck, True)
             return True, []
+
         show_list = []
         public_missing = False
+
         for ch in channels:
             ctype = (ch["channel_type"] or "public").lower()
+
+            # External va Private kanallarni tekshirmaymiz — ular doim "obuna" hisoblanadi
+            # Chunki get_chat_member ular uchun ishlamaydi
             if ctype in ("external", "link", "private"):
-                show_list.append(ch)
                 continue
+
+            # Faqat PUBLIC kanallar tekshiriladi
             chat_id = ch["chat_id"]
             if not chat_id and ch["username"]:
                 chat_id = "@" + ch["username"].lstrip("@")
+
             subscribed = False
             if chat_id:
                 try:
                     member = bot.get_chat_member(chat_id, user_id)
                     if member.status not in ("left", "kicked"):
                         subscribed = True
-                except Exception:
+                except Exception as e:
+                    # Agar API xatolik bersa — obuna emas deb hisoblaymiz
+                    print(f"check_sub API error for {chat_id}: {e}")
                     subscribed = False
+
             if not subscribed:
                 public_missing = True
                 show_list.append(ch)
+
         ok = not public_missing
-        if ok:
-            _cache[sub_ck] = True
-            _cache_ts[sub_ck] = time.time() - CACHE_TTL + 600
-        else:
-            _cache.pop(sub_ck, None)
-            _cache_ts.pop(sub_ck, None)
         return ok, show_list
 
     def show_forced_sub(chat_id: int, user_id: int, missing: List, edit_msg_id=None):
-        text = "📢 <b>Botdan foydalanish uchun kanallarga obuna bo'ling:</b>\n\n"
+        text = "📢 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:</b>\n\n"
         mk = types.InlineKeyboardMarkup(row_width=1)
         for ch in missing:
             title = ch["title"] or ch["username"] or "Kanal"
@@ -1091,15 +1101,16 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             else:
                 text += f"• {icon} {title}\n"
         mk.add(types.InlineKeyboardButton("🔄 Tekshirish", callback_data=f"u:checksub:{bot_id}"))
-        if get_setting(bot_id, "pro_enabled", 1) and get_setting(bot_id, "payments_enabled", 1):
-            mk.add(types.InlineKeyboardButton("💎 Premium olish", callback_data=f"u:premium:{bot_id}"))
         try:
             if edit_msg_id:
                 bot.edit_message_text(text, chat_id, edit_msg_id, parse_mode="HTML", reply_markup=mk)
             else:
                 bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=mk)
         except Exception:
-            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=mk)
+            try:
+                bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=mk)
+            except Exception:
+                pass
 
     def user_main_menu(chat_id: int, user_id: int, edit=False, msg_id=None):
         pro_on = bool(get_setting(bot_id, "pro_enabled", 1))
@@ -1144,42 +1155,21 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             chat_id = c.message.chat.id
             msg_id = c.message.message_id
 
+            # ============ MAJBURIY OBUNA — HAR BIR TUGMADA ============
+            # a: (admin) va u:checksub: bundan mustasno
+            if not data.startswith("a:") and not data.startswith("u:checksub:"):
+                ok, show_list = check_sub(uid)
+                if not ok:
+                    show_forced_sub(chat_id, uid, show_list, edit_msg_id=msg_id)
+                    return
+            # ============ MAJBURIY OBUNA TUGADI ============
+
             if data.startswith("u:checksub:"):
-                ok, show_list = check_sub(uid, force=True)
+                ok, show_list = check_sub(uid)
                 if ok:
                     user_main_menu(chat_id, uid, edit=True, msg_id=msg_id)
                 else:
                     show_forced_sub(chat_id, uid, show_list, edit_msg_id=msg_id)
-
-            elif data.startswith("u:premium:"):
-                if not get_setting(bot_id, "pro_enabled", 1):
-                    bot.answer_callback_query(c.id, "PRO o'chirilgan", show_alert=True)
-                    return
-                with db() as conn:
-                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                        cur.execute(
-                            "SELECT * FROM plans WHERE bot_id=%s AND is_active=1 ORDER BY days",
-                            (bot_id,)
-                        )
-                        plans = cur.fetchall()
-                if not plans:
-                    set_state(bot_id, uid, "premium_amount")
-                    bot.edit_message_text(
-                        "💎 <b>Premium</b>\n\nTo'lov summasini so'mda yuboring:",
-                        chat_id, msg_id, parse_mode="HTML",
-                        reply_markup=kb_back(f"u:checksub:{bot_id}")
-                    )
-                    return
-                text = "💎 <b>PREMIUM TARIFLAR</b>\n\n"
-                mk = types.InlineKeyboardMarkup(row_width=1)
-                for p in plans:
-                    text += f"• {p['name']} — {p['days']} kun — {p['price']} so'm\n"
-                    mk.add(types.InlineKeyboardButton(
-                        f"{p['name']} ({p['price']} so'm)",
-                        callback_data=f"u:plan:{bot_id}:{p['plan_id']}"
-                    ))
-                mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"u:checksub:{bot_id}"))
-                bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("u:main:"):
                 user_main_menu(chat_id, uid, edit=True, msg_id=msg_id)
@@ -1743,6 +1733,17 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         uid = m.from_user.id
         state, data = get_state(bot_id, uid)
         try:
+            # ============ MAJBURIY OBUNA — MATNLI XABARLARDA ============
+            # Faqat foydalanuvchi holatlari uchun (admin holatlari emas)
+            user_states = ("search", "premium_amount", "premium_check", "pay_check")
+            if state in user_states:
+                ok, show_list = check_sub(uid)
+                if not ok:
+                    clear_state(bot_id, uid)
+                    show_forced_sub(m.chat.id, uid, show_list)
+                    return
+            # ============ MAJBURIY OBUNA TUGADI ============
+
             if state == "search":
                 q = (m.text or "").strip()
                 if not q:
@@ -1901,6 +1902,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                                     INSERT INTO channels (bot_id, chat_id, username, title, channel_type, url)
                                     VALUES (%s, %s, %s, %s, 'public', %s)
                                 """, (bot_id, chat_id_str, username, title, url))
+                        cache_del_prefix(f"chs:{bot_id}")
                         clear_state(bot_id, uid)
                         bot.reply_to(m, f"✅ Kanal qo'shildi: {title}", reply_markup=kb_back(f"a:main:{bot_id}"))
                     else:
@@ -1914,6 +1916,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                                 INSERT INTO channels (bot_id, title, channel_type, url)
                                 VALUES (%s, %s, 'external', %s)
                             """, (bot_id, url, url))
+                    cache_del_prefix(f"chs:{bot_id}")
                     clear_state(bot_id, uid)
                     bot.reply_to(m, "✅ Link qo'shildi.", reply_markup=kb_back(f"a:main:{bot_id}"))
                 else:
@@ -1930,6 +1933,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             INSERT INTO channels (bot_id, chat_id, title, channel_type, url)
                             VALUES (%s, %s, %s, 'private', %s)
                         """, (bot_id, data.get("chat_id"), data.get("title", "Maxfiy kanal"), url))
+                cache_del_prefix(f"chs:{bot_id}")
                 clear_state(bot_id, uid)
                 bot.reply_to(m, f"✅ Maxfiy kanal qo'shildi!\nLink: {url}", reply_markup=kb_back(f"a:main:{bot_id}"))
 
