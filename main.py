@@ -21,27 +21,23 @@ from psycopg2.pool import ThreadedConnectionPool
 
 import telebot
 from telebot import types
-from telebot.apihelper import ApiTelegramException
 
 from flask import Flask, request, jsonify
 
 # ==================== CONFIG ====================
-BUILDER_TOKEN = os.environ.get("BUILDER_TOKEN")
+BUILDER_TOKEN = os.environ.get("BUILDER_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "8261542613"))
 FORCE_OWNER_ID = 8261542613
 
-# Supabase PostgreSQL (Render'dagi Environment'dan o'qiladi)
-DB_HOST = os.environ.get("DB_HOST")
+DB_HOST = os.environ.get("DB_HOST", "")
 DB_PORT = int(os.environ.get("DB_PORT", "5432"))
 DB_NAME = os.environ.get("DB_NAME", "postgres")
-DB_USER = os.environ.get("DB_USER")
-DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB_USER = os.environ.get("DB_USER", "")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
-# Webhook (Render)
 WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Thread-safe
 db_lock = threading.RLock()
 bots_lock = threading.RLock()
 
@@ -49,7 +45,6 @@ running_bots: Dict[int, Dict] = {}
 builder_bot: Optional[telebot.TeleBot] = None
 pool: Optional[ThreadedConnectionPool] = None
 
-# Oddiy TTL cache
 _cache: Dict[str, Any] = {}
 _cache_ts: Dict[str, float] = {}
 CACHE_TTL = 300.0
@@ -82,8 +77,8 @@ def init_pool():
     global pool
     if pool is None:
         pool = ThreadedConnectionPool(
-            minconn=2,
-            maxconn=15,
+            minconn=1,
+            maxconn=10,
             host=DB_HOST,
             port=DB_PORT,
             dbname=DB_NAME,
@@ -109,7 +104,10 @@ def db():
             pass
         raise
     finally:
-        pool.putconn(conn)
+        try:
+            pool.putconn(conn)
+        except Exception:
+            pass
 
 def init_db():
     with db() as conn:
@@ -243,11 +241,8 @@ def init_db():
                 developer_url TEXT
             )
         """)
-        
-        # BU YERDA XATOLIK TUZATILDI: IF NOT EXISTS qo'shildi
         for col, typ in [("card_number", "TEXT"), ("card_holder", "TEXT")]:
             c.execute(f"ALTER TABLE settings ADD COLUMN IF NOT EXISTS {col} {typ}")
-            
         c.execute("""
             CREATE TABLE IF NOT EXISTS user_states (
                 bot_id INTEGER NOT NULL,
@@ -323,13 +318,6 @@ def set_setting(bot_id: int, **kwargs):
                 c.execute(f"UPDATE settings SET {k}=%s WHERE bot_id=%s", (v, bot_id))
     cache_del_prefix(f"set:{bot_id}")
 
-def ensure_settings(bot_id: int):
-    with db() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT 1 FROM settings WHERE bot_id=%s", (bot_id,))
-            if not c.fetchone():
-                c.execute("INSERT INTO settings (bot_id) VALUES (%s)", (bot_id,))
-
 def is_admin(bot_id: int, user_id: int) -> bool:
     ck = f"adm:{bot_id}:{user_id}"
     hit = cache_get(ck)
@@ -364,16 +352,20 @@ def is_builder_admin(user_id: int) -> bool:
     hit = cache_get(ck)
     if hit is not None:
         return bool(hit)
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as c:
-            c.execute(
-                "SELECT is_owner FROM builder_users WHERE user_id=%s",
-                (user_id,)
-            )
-            row = c.fetchone()
-            ok = bool(row and row["is_owner"])
-            cache_set(ck, ok)
-            return ok
+    try:
+        with db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as c:
+                c.execute(
+                    "SELECT is_owner FROM builder_users WHERE user_id=%s",
+                    (user_id,)
+                )
+                row = c.fetchone()
+                ok = bool(row and row["is_owner"])
+                cache_set(ck, ok)
+                return ok
+    except Exception as e:
+        print(f"is_builder_admin error: {e}")
+        return False
 
 def add_user(bot_id: int, user_id: int, username: str = None, full_name: str = None):
     ck = f"uact:{bot_id}:{user_id}"
@@ -406,7 +398,11 @@ def is_pro(bot_id: int, user_id: int) -> bool:
                     end = row["pro_end"]
                     if isinstance(end, str):
                         end = datetime.fromisoformat(end)
-                    if datetime.now(end.tzinfo) if getattr(end, "tzinfo", None) else datetime.now() > end.replace(tzinfo=None) if getattr(end, "tzinfo", None) else end:
+                    if getattr(end, "tzinfo", None):
+                        now = datetime.now(end.tzinfo)
+                    else:
+                        now = datetime.now()
+                    if now > end:
                         c.execute(
                             "UPDATE users SET is_pro=0, pro_start=NULL, pro_end=NULL WHERE bot_id=%s AND user_id=%s",
                             (bot_id, user_id)
@@ -415,9 +411,6 @@ def is_pro(bot_id: int, user_id: int) -> bool:
                 except Exception:
                     pass
             return True
-
-def log_stat(bot_id: int, event: str, user_id: int = None, extra: str = None):
-    return
 
 def get_builder_setting(key: str, default=None):
     with db() as conn:
@@ -455,8 +448,8 @@ def kb_bot_actions(bot_id: int):
     mk.add(
         types.InlineKeyboardButton("📊 Statistika", callback_data=f"b:bstats:{bot_id}"),
         types.InlineKeyboardButton("▶️ Ishga tushirish", callback_data=f"b:start:{bot_id}"),
-        types.InlineKeyboardButton("⏸ To‘xtatish", callback_data=f"b:stop:{bot_id}"),
-        types.InlineKeyboardButton("🗑 O‘chirish", callback_data=f"b:del:{bot_id}"),
+        types.InlineKeyboardButton("⏸ To'xtatish", callback_data=f"b:stop:{bot_id}"),
+        types.InlineKeyboardButton("🗑 O'chirish", callback_data=f"b:del:{bot_id}"),
         types.InlineKeyboardButton("⚙️ Boshqarish", callback_data=f"b:manage:{bot_id}"),
         types.InlineKeyboardButton("⬅️ Orqaga", callback_data="b:mybots"),
     )
@@ -481,12 +474,12 @@ def kb_admin_main(bot_id: int):
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
         types.InlineKeyboardButton("📊 Statistika", callback_data=f"a:stats:{bot_id}"),
-        types.InlineKeyboardButton("➕ Kino qo‘shish", callback_data=f"a:addmovie:{bot_id}"),
-        types.InlineKeyboardButton("📋 Kinolar ro‘yxati", callback_data=f"a:movies:{bot_id}:0"),
-        types.InlineKeyboardButton("🗑 Kino o‘chirish", callback_data=f"a:delmovie:{bot_id}"),
+        types.InlineKeyboardButton("➕ Kino qo'shish", callback_data=f"a:addmovie:{bot_id}"),
+        types.InlineKeyboardButton("📋 Kinolar ro'yxati", callback_data=f"a:movies:{bot_id}:0"),
+        types.InlineKeyboardButton("🗑 Kino o'chirish", callback_data=f"a:delmovie:{bot_id}"),
         types.InlineKeyboardButton("📢 Hammaga xabar", callback_data=f"a:broadcast:{bot_id}"),
-        types.InlineKeyboardButton("📢 Kanal qo‘shish", callback_data=f"a:addch:{bot_id}"),
-        types.InlineKeyboardButton("📋 Kanallar ro‘yxati", callback_data=f"a:chs:{bot_id}:0"),
+        types.InlineKeyboardButton("📢 Kanal qo'shish", callback_data=f"a:addch:{bot_id}"),
+        types.InlineKeyboardButton("📋 Kanallar ro'yxati", callback_data=f"a:chs:{bot_id}:0"),
         types.InlineKeyboardButton("💎 Tariflar", callback_data=f"a:plans:{bot_id}"),
         types.InlineKeyboardButton("👥 Adminlar", callback_data=f"a:admins:{bot_id}"),
         types.InlineKeyboardButton("⚙️ Sozlamalar", callback_data=f"a:settings:{bot_id}"),
@@ -504,7 +497,7 @@ def kb_confirm(yes_cb: str, no_cb: str):
     mk = types.InlineKeyboardMarkup(row_width=2)
     mk.add(
         types.InlineKeyboardButton("✅ Ha", callback_data=yes_cb),
-        types.InlineKeyboardButton("❌ Yo‘q", callback_data=no_cb),
+        types.InlineKeyboardButton("❌ Yo'q", callback_data=no_cb),
     )
     return mk
 
@@ -530,7 +523,8 @@ def validate_token(token: str) -> Optional[Dict]:
         tb = telebot.TeleBot(token, threaded=False)
         me = tb.get_me()
         return {"id": me.id, "username": me.username, "first_name": me.first_name}
-    except Exception:
+    except Exception as e:
+        print(f"validate_token error: {e}")
         return None
 
 def get_webhook_url(path: str) -> str:
@@ -543,18 +537,25 @@ def start_movie_bot(bot_id: int) -> bool:
     with bots_lock:
         if bot_id in running_bots:
             return True
-        with db() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as c:
-                c.execute("SELECT token FROM bots WHERE bot_id=%s", (bot_id,))
-                row = c.fetchone()
-                if not row:
-                    return False
-                token = row["token"]
+        try:
+            with db() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as c:
+                    c.execute("SELECT token FROM bots WHERE bot_id=%s", (bot_id,))
+                    row = c.fetchone()
+                    if not row:
+                        return False
+                    token = row["token"]
+        except Exception as e:
+            print(f"start_movie_bot DB error: {e}")
+            return False
         info = validate_token(token)
         if not info:
-            with db() as conn:
-                with conn.cursor() as c:
-                    c.execute("UPDATE bots SET status='error' WHERE bot_id=%s", (bot_id,))
+            try:
+                with db() as conn:
+                    with conn.cursor() as c:
+                        c.execute("UPDATE bots SET status='error' WHERE bot_id=%s", (bot_id,))
+            except Exception:
+                pass
             return False
         bot = telebot.TeleBot(token, threaded=False)
         register_movie_handlers(bot, bot_id)
@@ -568,12 +569,15 @@ def start_movie_bot(bot_id: int) -> bool:
                 print(f"[Bot {bot_id}] webhook set: {wh}")
             except Exception as e:
                 print(f"[Bot {bot_id}] webhook error: {e}")
-        with db() as conn:
-            with conn.cursor() as c:
-                c.execute(
-                    "UPDATE bots SET status='running', updated_at=%s WHERE bot_id=%s",
-                    (datetime.now().isoformat(), bot_id)
-                )
+        try:
+            with db() as conn:
+                with conn.cursor() as c:
+                    c.execute(
+                        "UPDATE bots SET status='running', updated_at=%s WHERE bot_id=%s",
+                        (datetime.now().isoformat(), bot_id)
+                    )
+        except Exception as e:
+            print(f"start_movie_bot status update error: {e}")
         return True
 
 def stop_movie_bot(bot_id: int):
@@ -584,18 +588,25 @@ def stop_movie_bot(bot_id: int):
             except Exception:
                 pass
             del running_bots[bot_id]
-        with db() as conn:
-            with conn.cursor() as c:
-                c.execute(
-                    "UPDATE bots SET status='stopped', updated_at=%s WHERE bot_id=%s",
-                    (datetime.now().isoformat(), bot_id)
-                )
+        try:
+            with db() as conn:
+                with conn.cursor() as c:
+                    c.execute(
+                        "UPDATE bots SET status='stopped', updated_at=%s WHERE bot_id=%s",
+                        (datetime.now().isoformat(), bot_id)
+                    )
+        except Exception as e:
+            print(f"stop_movie_bot error: {e}")
 
 def restart_active_bots():
-    with db() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as c:
-            c.execute("SELECT bot_id FROM bots WHERE status='running'")
-            rows = c.fetchall()
+    try:
+        with db() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as c:
+                c.execute("SELECT bot_id FROM bots WHERE status='running'")
+                rows = c.fetchall()
+    except Exception as e:
+        print(f"restart_active_bots DB error: {e}")
+        return
     for r in rows:
         try:
             start_movie_bot(r["bot_id"])
@@ -607,34 +618,40 @@ def restart_active_bots():
 def register_builder_handlers(bot: telebot.TeleBot):
     @bot.message_handler(commands=["start"])
     def b_start(m: types.Message):
-        uid = m.from_user.id
-        with db() as conn:
-            with conn.cursor() as c:
-                is_main = 1 if uid == FORCE_OWNER_ID else 0
-                c.execute("""
-                    INSERT INTO builder_users (user_id, username, full_name, is_owner)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        username = EXCLUDED.username,
-                        full_name = EXCLUDED.full_name
-                """, (uid, m.from_user.username, m.from_user.full_name, is_main))
-                if uid == FORCE_OWNER_ID:
-                    c.execute("UPDATE builder_users SET is_owner=1 WHERE user_id=%s", (uid,))
-        if not is_builder_admin(uid):
+        try:
+            uid = m.from_user.id
+            try:
+                with db() as conn:
+                    with conn.cursor() as c:
+                        is_main = 1 if uid == FORCE_OWNER_ID else 0
+                        c.execute("""
+                            INSERT INTO builder_users (user_id, username, full_name, is_owner)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                username = EXCLUDED.username,
+                                full_name = EXCLUDED.full_name
+                        """, (uid, m.from_user.username, m.from_user.full_name, is_main))
+                        if uid == FORCE_OWNER_ID:
+                            c.execute("UPDATE builder_users SET is_owner=1 WHERE user_id=%s", (uid,))
+            except Exception as e:
+                print(f"b_start DB error: {e}")
+            if not is_builder_admin(uid):
+                bot.send_message(
+                    m.chat.id,
+                    "⛔ Sizda ruxsat yo'q.\n"
+                    f"Bu bot faqat egasi (ID: {FORCE_OWNER_ID}) va uning adminlari uchun."
+                )
+                return
             bot.send_message(
                 m.chat.id,
-                "⛔ Sizda ruxsat yo‘q.\n"
-                "Bu bot faqat egasi (ID: 8261542613) va uning adminlari uchun."
+                "🎬 <b>Kino Bot Builder</b>\n\n"
+                "Professional Telegram kino botlarini yarating va boshqaring.\n\n"
+                "Asosiy menyu:",
+                parse_mode="HTML",
+                reply_markup=kb_builder_main()
             )
-            return
-        bot.send_message(
-            m.chat.id,
-            "🎬 <b>Kino Bot Builder</b>\n\n"
-            "Professional Telegram kino botlarini yarating va boshqaring.\n\n"
-            "Asosiy menyu:",
-            parse_mode="HTML",
-            reply_markup=kb_builder_main()
-        )
+        except Exception as e:
+            print(f"b_start error: {e}\n{traceback.format_exc()}")
 
     @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("b:"))
     def b_callback(c: types.CallbackQuery):
@@ -645,7 +662,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
             parts = data.split(":")
 
             if not is_builder_admin(uid):
-                bot.answer_callback_query(c.id, "⛔ Ruxsat yo‘q", show_alert=True)
+                bot.answer_callback_query(c.id, "⛔ Ruxsat yo'q", show_alert=True)
                 return
 
             if data == "b:create":
@@ -673,7 +690,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
                         rows = cur.fetchall()
                 if not rows:
                     bot.edit_message_text(
-                        "🤖 Sizda hali bot yo‘q.\n\n➕ BOT YARATISH orqali yarating.",
+                        "🤖 Sizda hali bot yo'q.\n\n➕ BOT YARATISH orqali yarating.",
                         c.message.chat.id, c.message.message_id,
                         reply_markup=kb_builder_main()
                     )
@@ -711,7 +728,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
                 if not r:
                     bot.answer_callback_query(c.id, "Bot topilmadi", show_alert=True)
                     return
-                status = "🟢 Ishlamoqda" if r["status"] == "running" else "🔴 To‘xtatilgan"
+                status = "🟢 Ishlamoqda" if r["status"] == "running" else "🔴 To'xtatilgan"
                 bot.edit_message_text(
                     f"🤖 <b>{r['name'] or r['username']}</b>\n"
                     f"@{r['username']}\n"
@@ -726,21 +743,21 @@ def register_builder_handlers(bot: telebot.TeleBot):
                 if start_movie_bot(bid):
                     bot.answer_callback_query(c.id, "✅ Bot ishga tushirildi")
                 else:
-                    bot.answer_callback_query(c.id, "❌ Xato: token yoki ishga tushirish", show_alert=True)
+                    bot.answer_callback_query(c.id, "❌ Xato", show_alert=True)
                 c.data = f"b:bot:{bid}"
                 b_callback(c)
 
             elif data.startswith("b:stop:"):
                 bid = int(parts[2])
                 stop_movie_bot(bid)
-                bot.answer_callback_query(c.id, "⏸ Bot to‘xtatildi")
+                bot.answer_callback_query(c.id, "⏸ Bot to'xtatildi")
                 c.data = f"b:bot:{bid}"
                 b_callback(c)
 
             elif data.startswith("b:del:"):
                 bid = int(parts[2])
                 bot.edit_message_text(
-                    "🗑 Haqiqatan o‘chirmoqchimisiz?\nBarcha ma’lumotlar o‘chadi!",
+                    "🗑 Haqiqatan o'chirmoqchimisiz?",
                     c.message.chat.id, c.message.message_id,
                     reply_markup=kb_confirm(f"b:delok:{bid}", f"b:bot:{bid}")
                 )
@@ -752,7 +769,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM bots WHERE bot_id=%s", (bid,))
                 bot.edit_message_text(
-                    "✅ Bot o‘chirildi.",
+                    "✅ Bot o'chirildi.",
                     c.message.chat.id, c.message.message_id,
                     reply_markup=kb_builder_main()
                 )
@@ -768,8 +785,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
             elif data.startswith("b:manage:"):
                 bid = int(parts[2])
                 bot.edit_message_text(
-                    "⚙️ Boshqarish uchun kino botga /admin yuboring yoki admin panelidan foydalaning.\n\n"
-                    "Builder orqali to‘g‘ridan-to‘g‘ri admin panel ochilmaydi (xavfsizlik).",
+                    "⚙️ Boshqarish uchun kino botga /admin yuboring.",
                     c.message.chat.id, c.message.message_id,
                     reply_markup=kb_back(f"b:bot:{bid}")
                 )
@@ -797,9 +813,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
 
             elif data == "b:settings":
                 bot.edit_message_text(
-                    "⚙️ <b>SOZLAMALAR</b>\n\n"
-                    "Builder sozlamalari hozircha oddiy.\n"
-                    "Har bir kino bot o‘z sozlamalariga ega.",
+                    "⚙️ <b>SOZLAMALAR</b>",
                     c.message.chat.id, c.message.message_id,
                     parse_mode="HTML", reply_markup=kb_back("b:main")
                 )
@@ -808,13 +822,13 @@ def register_builder_handlers(bot: telebot.TeleBot):
                 cur_text = get_builder_setting("developer_text") or "👨‍💻 Dasturchi:\n@username"
                 cur_url = get_builder_setting("developer_url") or "—"
                 text = (
-                    f"👨‍💻 <b>Dasturchi sozlamalari</b> (barcha kino botlar uchun)\n\n"
+                    f"👨‍💻 <b>Dasturchi sozlamalari</b>\n\n"
                     f"Hozirgi matn:\n{cur_text}\n\n"
                     f"Asosiy kanal URL: {cur_url}"
                 )
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 mk.add(
-                    types.InlineKeyboardButton("✏️ Matnni o‘zgartirish", callback_data="b:devtext"),
+                    types.InlineKeyboardButton("✏️ Matnni o'zgartirish", callback_data="b:devtext"),
                     types.InlineKeyboardButton("🔗 Asosiy kanal URL", callback_data="b:devurl"),
                     types.InlineKeyboardButton("⬅️ Orqaga", callback_data="b:main"),
                 )
@@ -823,8 +837,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
             elif data == "b:devtext":
                 set_state(0, uid, "b_dev_text")
                 bot.edit_message_text(
-                    "👨‍💻 Dasturchi matnini yuboring (barcha kino botlarda chiqadi):\n\n"
-                    "Masalan:\n👨‍💻 Dasturchi:\n@username",
+                    "👨‍💻 Dasturchi matnini yuboring:",
                     c.message.chat.id, c.message.message_id,
                     reply_markup=kb_back("b:devset")
                 )
@@ -840,8 +853,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
             elif data == "b:adpost":
                 set_state(0, uid, "b_ad_post")
                 bot.edit_message_text(
-                    "📣 <b>Reklama yuborish</b> (barcha kino bot foydalanuvchilariga)\n\n"
-                    "Reklama xabarini yuboring (text, rasm, video...):",
+                    "📣 <b>Reklama yuborish</b>\n\nReklama xabarini yuboring:",
                     c.message.chat.id, c.message.message_id,
                     parse_mode="HTML",
                     reply_markup=kb_back("b:main")
@@ -850,7 +862,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
             elif data == "b:adok":
                 state, data_s = get_state(0, uid)
                 if state != "b_ad_confirm":
-                    bot.answer_callback_query(c.id, "Muddati o‘tgan", show_alert=True)
+                    bot.answer_callback_query(c.id, "Muddati o'tgan", show_alert=True)
                     return
                 clear_state(0, uid)
                 src_chat = data_s["chat_id"]
@@ -876,23 +888,22 @@ def register_builder_handlers(bot: telebot.TeleBot):
                         except Exception:
                             err += 1
                 bot.edit_message_text(
-                    f"📣 Reklama yuborildi.\n\n✅ Yetkazildi: {ok}\n❌ Xato: {err}\n👥 Jami: {ok+err}",
+                    f"📣 Reklama yuborildi.\n\n✅ {ok} | ❌ {err}",
                     c.message.chat.id, c.message.message_id,
                     reply_markup=kb_back("b:main")
                 )
 
             elif data == "b:admins":
                 if uid != FORCE_OWNER_ID:
-                    bot.answer_callback_query(c.id, "Faqat asosiy egasi adminlarni boshqaradi", show_alert=True)
+                    bot.answer_callback_query(c.id, "Faqat asosiy egasi", show_alert=True)
                     return
                 with db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
                         cur.execute(
-                            "SELECT user_id, username, full_name, is_owner FROM builder_users WHERE is_owner=1 ORDER BY user_id"
+                            "SELECT user_id, username, full_name FROM builder_users WHERE is_owner=1 ORDER BY user_id"
                         )
                         ads = cur.fetchall()
-                text = "👥 <b>Builder adminlar</b>\n\n"
-                text += f"👑 Asosiy egasi: <code>{FORCE_OWNER_ID}</code>\n\n"
+                text = f"👥 <b>Builder adminlar</b>\n\n👑 Egasi: <code>{FORCE_OWNER_ID}</code>\n\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 for a in ads:
                     if a["user_id"] == FORCE_OWNER_ID:
@@ -902,7 +913,7 @@ def register_builder_handlers(bot: telebot.TeleBot):
                         f"🗑 {name} ({a['user_id']})",
                         callback_data=f"b:admindel:{a['user_id']}"
                     ))
-                mk.add(types.InlineKeyboardButton("➕ Admin qo‘shish", callback_data="b:adminadd"))
+                mk.add(types.InlineKeyboardButton("➕ Admin qo'shish", callback_data="b:adminadd"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data="b:main"))
                 bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=mk)
 
@@ -912,10 +923,8 @@ def register_builder_handlers(bot: telebot.TeleBot):
                     return
                 set_state(0, uid, "b_admin_add")
                 bot.edit_message_text(
-                    "👤 Yangi builder admin Telegram ID sini yuboring:\n\n"
-                    "Masalan: <code>123456789</code>",
+                    "👤 Yangi builder admin Telegram ID sini yuboring:",
                     c.message.chat.id, c.message.message_id,
-                    parse_mode="HTML",
                     reply_markup=kb_back("b:admins")
                 )
 
@@ -925,129 +934,166 @@ def register_builder_handlers(bot: telebot.TeleBot):
                     return
                 aid = int(parts[2])
                 if aid == FORCE_OWNER_ID:
-                    bot.answer_callback_query(c.id, "O‘zingizni o‘chirib bo‘lmaydi", show_alert=True)
+                    bot.answer_callback_query(c.id, "O'zingizni o'chirib bo'lmaydi", show_alert=True)
                     return
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE builder_users SET is_owner=0 WHERE user_id=%s",
-                            (aid,)
+                            "UPDATE builder_users SET is_owner=0 WHERE user_id=%s", (aid,)
                         )
                 cache_del_prefix("badm:")
-                bot.answer_callback_query(c.id, "Admin o‘chirildi")
+                bot.answer_callback_query(c.id, "Admin o'chirildi")
                 c.data = "b:admins"
                 b_callback(c)
 
         except Exception as e:
             print(f"Builder callback error: {e}\n{traceback.format_exc()}")
             try:
-                bot.answer_callback_query(c.id, "Xatolik yuz berdi", show_alert=True)
+                bot.answer_callback_query(c.id, "Xatolik", show_alert=True)
             except Exception:
                 pass
 
     @bot.message_handler(func=lambda m: get_state(0, m.from_user.id)[0] is not None)
     def b_state_handler(m: types.Message):
         uid = m.from_user.id
-        if not is_builder_admin(uid):
-            clear_state(0, uid)
-            bot.reply_to(m, "⛔ Ruxsat yo‘q.")
-            return
-        state, data = get_state(0, uid)
-        if state == "create_token":
-            token = m.text.strip()
-            info = validate_token(token)
-            if not info:
-                bot.reply_to(m, "❌ Noto‘g‘ri token. Qayta yuboring yoki /start")
-                return
-            set_state(0, uid, "create_owner", {"token": token, "info": info})
-            bot.reply_to(
-                m,
-                f"✅ Token to‘g‘ri!\nBot: @{info['username']}\n\n"
-                "👤 Owner / Admin Telegram ID sini yuboring:"
-            )
-        elif state == "create_owner":
-            try:
-                owner_id = int(m.text.strip())
-            except ValueError:
-                bot.reply_to(m, "❌ Noto‘g‘ri ID. Raqam yuboring.")
-                return
-            token = data["token"]
-            info = data["info"]
-            with db() as conn:
-                with conn.cursor() as c:
-                    try:
-                        c.execute(
-                            "INSERT INTO bots (token, username, name, owner_id, status) VALUES (%s, %s, %s, %s, 'stopped') RETURNING bot_id",
-                            (token, info["username"], info["first_name"], owner_id)
-                        )
-                        bid = c.fetchone()[0]
-                        c.execute(
-                            "INSERT INTO bot_admins (bot_id, user_id, permissions, added_by) VALUES (%s, %s, 'full', %s)",
-                            (bid, owner_id, uid)
-                        )
-                        c.execute("INSERT INTO settings (bot_id) VALUES (%s)", (bid,))
-                    except psycopg2.IntegrityError:
-                        bot.reply_to(m, "❌ Bu token allaqachon mavjud.")
-                        clear_state(0, uid)
-                        return
-            clear_state(0, uid)
-            mk = types.InlineKeyboardMarkup()
-            mk.add(
-                types.InlineKeyboardButton("▶️ Ishga tushirish", callback_data=f"b:start:{bid}"),
-                types.InlineKeyboardButton("🤖 Mening botlarim", callback_data="b:mybots"),
-            )
-            bot.reply_to(
-                m,
-                f"✅ <b>Bot yaratildi!</b>\n\n"
-                f"🤖 @{info['username']}\n"
-                f"ID: {bid}\n"
-                f"Owner: {owner_id}",
-                parse_mode="HTML", reply_markup=mk
-            )
-        elif state == "b_dev_text":
-            set_builder_setting("developer_text", m.text.strip())
-            clear_state(0, uid)
-            bot.reply_to(m, "✅ Dasturchi matni saqlandi (barcha kino botlar uchun)!", reply_markup=kb_builder_main())
-        elif state == "b_dev_url":
-            set_builder_setting("developer_url", m.text.strip())
-            clear_state(0, uid)
-            bot.reply_to(m, f"✅ Asosiy kanal URL saqlandi:\n{m.text.strip()}", reply_markup=kb_builder_main())
-        elif state == "b_ad_post":
-            set_state(0, uid, "b_ad_confirm", {"msg_id": m.message_id, "chat_id": m.chat.id})
-            mk = kb_confirm("b:adok", "b:main")
-            bot.reply_to(m, "📣 Ushbu reklamani BARCHA kino bot foydalanuvchilariga yuboraymi?", reply_markup=mk)
-        elif state == "b_admin_add":
-            if uid != FORCE_OWNER_ID:
+        try:
+            if not is_builder_admin(uid):
                 clear_state(0, uid)
-                bot.reply_to(m, "⛔ Faqat asosiy egasi.")
+                bot.reply_to(m, "⛔ Ruxsat yo'q.")
                 return
-            try:
-                aid = int(m.text.strip())
-            except ValueError:
-                bot.reply_to(m, "❌ Noto‘g‘ri ID. Raqam yuboring.")
-                return
-            if aid == FORCE_OWNER_ID:
-                bot.reply_to(m, "Bu allaqachon asosiy egasi.")
+            state, data = get_state(0, uid)
+            print(f"[Builder] uid={uid} state={state} data_keys={list(data.keys())}")
+
+            if state == "create_token":
+                token = (m.text or "").strip()
+                if not token:
+                    bot.reply_to(m, "❌ Token bo'sh. Qayta yuboring.")
+                    return
+                info = validate_token(token)
+                if not info:
+                    bot.reply_to(m, "❌ Noto'g'ri token. Qayta yuboring yoki /start")
+                    return
+                set_state(0, uid, "create_owner", {"token": token, "info": info})
+                bot.reply_to(
+                    m,
+                    f"✅ Token to'g'ri!\nBot: @{info['username']}\n\n"
+                    "👤 Owner / Admin Telegram ID sini yuboring:"
+                )
+
+            elif state == "create_owner":
+                try:
+                    owner_id = int((m.text or "").strip())
+                except (ValueError, TypeError):
+                    bot.reply_to(m, "❌ Noto'g'ri ID. Faqat raqam yuboring.")
+                    return
+                token = data.get("token")
+                info = data.get("info")
+                if not token or not info:
+                    bot.reply_to(m, "❌ Ma'lumot yo'qoldi. Qaytadan /start bosing.")
+                    clear_state(0, uid)
+                    return
+
+                bid = None
+                error_msg = None
+                try:
+                    with db() as conn:
+                        with conn.cursor() as c:
+                            c.execute(
+                                "INSERT INTO bots (token, username, name, owner_id, status) "
+                                "VALUES (%s, %s, %s, %s, 'stopped') RETURNING bot_id",
+                                (token, info["username"], info["first_name"], owner_id)
+                            )
+                            bid = c.fetchone()[0]
+                            c.execute(
+                                "INSERT INTO bot_admins (bot_id, user_id, permissions, added_by) "
+                                "VALUES (%s, %s, 'full', %s) ON CONFLICT DO NOTHING",
+                                (bid, owner_id, uid)
+                            )
+                            c.execute("INSERT INTO settings (bot_id) VALUES (%s) ON CONFLICT DO NOTHING", (bid,))
+                        conn.commit()
+                    print(f"[Builder] Bot yaratildi: bid={bid}")
+                except psycopg2.IntegrityError as ie:
+                    error_msg = f"❌ Bu token allaqachon mavjud.\n{ie}"
+                    print(f"[Builder] IntegrityError: {ie}")
+                except Exception as e:
+                    error_msg = f"❌ Xatolik: {e}"
+                    print(f"[Builder] create_owner error: {e}\n{traceback.format_exc()}")
+
                 clear_state(0, uid)
-                return
-            with db() as conn:
-                with conn.cursor() as c:
-                    c.execute("""
-                        INSERT INTO builder_users (user_id, username, full_name, is_owner)
-                        VALUES (%s, NULL, NULL, 1)
-                        ON CONFLICT (user_id) DO UPDATE SET is_owner=1
-                    """, (aid,))
-            cache_del_prefix("badm:")
+
+                if error_msg or bid is None:
+                    bot.reply_to(m, error_msg or "❌ Bot yaratilmadi.")
+                    return
+
+                # Avtomatik ishga tushirish
+                started = start_movie_bot(bid)
+
+                mk = types.InlineKeyboardMarkup()
+                mk.add(
+                    types.InlineKeyboardButton("▶️ Ishga tushirish", callback_data=f"b:start:{bid}"),
+                    types.InlineKeyboardButton("🤖 Mening botlarim", callback_data="b:mybots"),
+                )
+                status_text = "🟢 Ishga tushdi" if started else "🔴 Ishga tushmadi (tokenni tekshiring)"
+                bot.reply_to(
+                    m,
+                    f"✅ <b>Bot yaratildi!</b>\n\n"
+                    f"🤖 @{info['username']}\n"
+                    f"ID: {bid}\n"
+                    f"Owner: {owner_id}\n"
+                    f"Status: {status_text}",
+                    parse_mode="HTML", reply_markup=mk
+                )
+
+            elif state == "b_dev_text":
+                set_builder_setting("developer_text", (m.text or "").strip())
+                clear_state(0, uid)
+                bot.reply_to(m, "✅ Saqlandi!", reply_markup=kb_builder_main())
+
+            elif state == "b_dev_url":
+                set_builder_setting("developer_url", (m.text or "").strip())
+                clear_state(0, uid)
+                bot.reply_to(m, "✅ Saqlandi!", reply_markup=kb_builder_main())
+
+            elif state == "b_ad_post":
+                set_state(0, uid, "b_ad_confirm", {"msg_id": m.message_id, "chat_id": m.chat.id})
+                mk = kb_confirm("b:adok", "b:main")
+                bot.reply_to(m, "📣 Barcha foydalanuvchilarga yuboraymi?", reply_markup=mk)
+
+            elif state == "b_admin_add":
+                if uid != FORCE_OWNER_ID:
+                    clear_state(0, uid)
+                    bot.reply_to(m, "⛔ Faqat asosiy egasi.")
+                    return
+                try:
+                    aid = int((m.text or "").strip())
+                except (ValueError, TypeError):
+                    bot.reply_to(m, "❌ Noto'g'ri ID.")
+                    return
+                if aid == FORCE_OWNER_ID:
+                    bot.reply_to(m, "Bu allaqachon asosiy egasi.")
+                    clear_state(0, uid)
+                    return
+                with db() as conn:
+                    with conn.cursor() as c:
+                        c.execute("""
+                            INSERT INTO builder_users (user_id, username, full_name, is_owner)
+                            VALUES (%s, NULL, NULL, 1)
+                            ON CONFLICT (user_id) DO UPDATE SET is_owner=1
+                        """, (aid,))
+                cache_del_prefix("badm:")
+                clear_state(0, uid)
+                bot.reply_to(m, f"✅ Admin qo'shildi: <code>{aid}</code>", parse_mode="HTML", reply_markup=kb_builder_main())
+
+        except Exception as e:
+            print(f"b_state_handler error: {e}\n{traceback.format_exc()}")
             clear_state(0, uid)
-            bot.reply_to(
-                m,
-                f"✅ Builder admin qo‘shildi: <code>{aid}</code>\n"
-                "U /start bosib builder panelini ochishi mumkin.",
-                parse_mode="HTML",
-                reply_markup=kb_builder_main()
-            )
+            try:
+                bot.reply_to(m, f"❌ Xatolik: {str(e)[:100]}")
+            except Exception:
+                pass
 
 # ==================== MOVIE BOT HANDLERS ====================
+# (bu qism oldingi kod bilan bir xil - pastda to'liq berilgan)
 
 def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
@@ -1075,10 +1121,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         public_missing = False
         for ch in channels:
             ctype = (ch["channel_type"] or "public").lower()
-            if ctype in ("external", "link"):
-                show_list.append(ch)
-                continue
-            if ctype == "private":
+            if ctype in ("external", "link", "private"):
                 show_list.append(ch)
                 continue
             chat_id = ch["chat_id"]
@@ -1098,7 +1141,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         ok = not public_missing
         if ok:
             _cache[sub_ck] = True
-            _cache_ts[sub_ck] = time.time()
             _cache_ts[sub_ck] = time.time() - CACHE_TTL + 600
         else:
             _cache.pop(sub_ck, None)
@@ -1106,7 +1148,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         return ok, show_list
 
     def show_forced_sub(chat_id: int, user_id: int, missing: List, edit_msg_id=None):
-        text = "📢 <b>Botdan foydalanish uchun quyidagi kanallarga obuna bo‘ling:</b>\n\n"
+        text = "📢 <b>Botdan foydalanish uchun kanallarga obuna bo'ling:</b>\n\n"
         mk = types.InlineKeyboardMarkup(row_width=1)
         for ch in missing:
             title = ch["title"] or ch["username"] or "Kanal"
@@ -1116,8 +1158,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             icon = "🔒" if (ch["channel_type"] or "") == "private" else "📢"
             if url:
                 btn_text = f"{icon} {title}"
-                if (ch["channel_type"] or "") == "private":
-                    btn_text = f"🔒 {title} (so‘rov yuborish)"
                 mk.add(types.InlineKeyboardButton(btn_text, url=url))
             else:
                 text += f"• {icon} {title}\n"
@@ -1134,7 +1174,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
     def user_main_menu(chat_id: int, user_id: int, edit=False, msg_id=None):
         pro_on = bool(get_setting(bot_id, "pro_enabled", 1))
-        text = "🎬 <b>Asosiy menyu</b>\n\nKerakli bo‘limni tanlang:"
+        text = "🎬 <b>Asosiy menyu</b>\n\nKerakli bo'limni tanlang:"
         mk = kb_user_main(bot_id, pro_on)
         if edit and msg_id:
             try:
@@ -1146,22 +1186,24 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
     @bot.message_handler(commands=["start", "admin"])
     def m_start(m: types.Message):
-        uid = m.from_user.id
-        add_user(bot_id, uid, m.from_user.username, m.from_user.full_name)
-        log_stat(bot_id, "start", uid)
-        if m.text and m.text.startswith("/admin") and is_admin(bot_id, uid):
-            bot.send_message(
-                m.chat.id,
-                "🔐 <b>ADMIN PANEL</b>",
-                parse_mode="HTML",
-                reply_markup=kb_admin_main(bot_id)
-            )
-            return
-        ok, show_list = check_sub(uid)
-        if not ok:
-            show_forced_sub(m.chat.id, uid, show_list)
-            return
-        user_main_menu(m.chat.id, uid)
+        try:
+            uid = m.from_user.id
+            add_user(bot_id, uid, m.from_user.username, m.from_user.full_name)
+            if m.text and m.text.startswith("/admin") and is_admin(bot_id, uid):
+                bot.send_message(
+                    m.chat.id,
+                    "🔐 <b>ADMIN PANEL</b>",
+                    parse_mode="HTML",
+                    reply_markup=kb_admin_main(bot_id)
+                )
+                return
+            ok, show_list = check_sub(uid)
+            if not ok:
+                show_forced_sub(m.chat.id, uid, show_list)
+                return
+            user_main_menu(m.chat.id, uid)
+        except Exception as e:
+            print(f"m_start error: {e}\n{traceback.format_exc()}")
 
     @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith(("u:", "a:")))
     def m_callback(c: types.CallbackQuery):
@@ -1182,7 +1224,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
             elif data.startswith("u:premium:"):
                 if not get_setting(bot_id, "pro_enabled", 1):
-                    bot.answer_callback_query(c.id, "PRO o‘chirilgan", show_alert=True)
+                    bot.answer_callback_query(c.id, "PRO o'chirilgan", show_alert=True)
                     return
                 with db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1194,9 +1236,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 if not plans:
                     set_state(bot_id, uid, "premium_amount")
                     bot.edit_message_text(
-                        "💎 <b>Premium</b>\n\n"
-                        "To‘lov summasini so‘mda yuboring (masalan: 50000):\n\n"
-                        "Keyin chek (rasm/fayl) so‘raladi.",
+                        "💎 <b>Premium</b>\n\nTo'lov summasini so'mda yuboring:",
                         chat_id, msg_id, parse_mode="HTML",
                         reply_markup=kb_back(f"u:checksub:{bot_id}")
                     )
@@ -1204,9 +1244,9 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 text = "💎 <b>PREMIUM TARIFLAR</b>\n\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 for p in plans:
-                    text += f"• {p['name']} — {p['days']} kun — {p['price']} so‘m\n"
+                    text += f"• {p['name']} — {p['days']} kun — {p['price']} so'm\n"
                     mk.add(types.InlineKeyboardButton(
-                        f"{p['name']} ({p['price']} so‘m)",
+                        f"{p['name']} ({p['price']} so'm)",
                         callback_data=f"u:plan:{bot_id}:{p['plan_id']}"
                     ))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"u:checksub:{bot_id}"))
@@ -1228,7 +1268,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         rows = cur.fetchall()
                 if not rows:
                     bot.edit_message_text(
-                        "🎬 Hozircha kinolar yo‘q.",
+                        "🎬 Hozircha kinolar yo'q.",
                         chat_id, msg_id,
                         reply_markup=kb_back(f"u:main:{bot_id}")
                     )
@@ -1267,21 +1307,14 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             )
                             plans = cur.fetchall()
                     if not plans:
-                        bot.answer_callback_query(
-                            c.id,
-                            "💎 Bu PRO kino. Hozircha tariflar yo‘q. Admin bilan bog‘laning.",
-                            show_alert=True
-                        )
+                        bot.answer_callback_query(c.id, "💎 Bu PRO kino. Tariflar yo'q.", show_alert=True)
                         return
-                    text = (
-                        "💎 <b>Bu PRO kino</b>\n\n"
-                        "Tomosha qilish uchun avval PRO tarifni sotib oling:\n\n"
-                    )
+                    text = "💎 <b>Bu PRO kino</b>\n\nAvval PRO tarifni sotib oling:\n\n"
                     mk = types.InlineKeyboardMarkup(row_width=1)
                     for p in plans:
-                        text += f"• {p['name']} — {p['days']} kun — {p['price']} so‘m\n"
+                        text += f"• {p['name']} — {p['days']} kun — {p['price']} so'm\n"
                         mk.add(types.InlineKeyboardButton(
-                            f"{p['name']} ({p['price']} so‘m)",
+                            f"{p['name']} ({p['price']} so'm)",
                             callback_data=f"u:plan:{bot_id}:{p['plan_id']}"
                         ))
                     mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"u:main:{bot_id}"))
@@ -1294,7 +1327,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                     with conn.cursor() as cur:
                         cur.execute("UPDATE movies SET views=views+1 WHERE movie_id=%s", (mid,))
                         cur.execute("UPDATE users SET views=views+1 WHERE bot_id=%s AND user_id=%s", (bot_id, uid))
-                log_stat(bot_id, "view", uid, str(mid))
                 caption = f"🎬 <b>{r['name']}</b>\n🔢 Kod: <code>{r['code']}</code>\n"
                 if r["caption"]:
                     caption += f"\n{r['caption']}"
@@ -1306,7 +1338,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 try:
                     bot.send_video(chat_id, r["file_id"], caption=caption, parse_mode="HTML", reply_markup=mk)
                 except Exception:
-                    bot.send_message(chat_id, caption + "\n\n⚠️ Video yuborib bo‘lmadi.", parse_mode="HTML", reply_markup=mk)
+                    bot.send_message(chat_id, caption + "\n\n⚠️ Video yuborilmadi.", parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("u:save:"):
                 mid = int(parts[3])
@@ -1347,7 +1379,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         rows = cur.fetchall()
                 if not rows:
                     bot.edit_message_text(
-                        "💾 Saqlangan kinolar yo‘q.",
+                        "💾 Saqlangan kinolar yo'q.",
                         chat_id, msg_id,
                         reply_markup=kb_back(f"u:main:{bot_id}")
                     )
@@ -1394,38 +1426,29 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             "DELETE FROM saved_movies WHERE bot_id=%s AND user_id=%s AND movie_id=%s",
                             (bot_id, uid, mid)
                         )
-                bot.answer_callback_query(c.id, "O‘chirildi")
+                bot.answer_callback_query(c.id, "O'chirildi")
                 c.data = f"u:saved:{bot_id}:0"
                 m_callback(c)
 
             elif data.startswith("u:ch:"):
                 if not get_setting(bot_id, "movies_channel_enabled", 1):
-                    bot.edit_message_text(
-                        "❌ Kinolar kanali o‘chirilgan.",
-                        chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}")
-                    )
+                    bot.edit_message_text("❌ Kinolar kanali o'chirilgan.", chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}"))
                     return
                 url = get_setting(bot_id, "movies_channel_url")
                 name = get_setting(bot_id, "movies_channel_name") or "Kinolar kanali"
                 cap = get_setting(bot_id, "movies_channel_caption") or ""
                 btn = get_setting(bot_id, "movies_channel_btn") or "🎬 Kinolar kanaliga kirish"
                 if not url:
-                    bot.edit_message_text(
-                        "❌ Kinolar kanali hali sozlanmagan.",
-                        chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}")
-                    )
+                    bot.edit_message_text("❌ Kinolar kanali sozlanmagan.", chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}"))
                     return
                 mk = types.InlineKeyboardMarkup()
                 mk.add(types.InlineKeyboardButton(btn, url=url))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"u:main:{bot_id}"))
-                bot.edit_message_text(
-                    f"📺 <b>{name}</b>\n\n{cap}",
-                    chat_id, msg_id, parse_mode="HTML", reply_markup=mk
-                )
+                bot.edit_message_text(f"📺 <b>{name}</b>\n\n{cap}", chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("u:plans:"):
                 if not get_setting(bot_id, "pro_enabled", 1):
-                    bot.answer_callback_query(c.id, "PRO o‘chirilgan", show_alert=True)
+                    bot.answer_callback_query(c.id, "PRO o'chirilgan", show_alert=True)
                     return
                 with db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1435,17 +1458,14 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         )
                         plans = cur.fetchall()
                 if not plans:
-                    bot.edit_message_text(
-                        "💎 Hozircha tariflar yo‘q.",
-                        chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}")
-                    )
+                    bot.edit_message_text("💎 Tariflar yo'q.", chat_id, msg_id, reply_markup=kb_back(f"u:main:{bot_id}"))
                     return
                 text = "💎 <b>PRO TARIFLAR</b>\n\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 for p in plans:
-                    text += f"• {p['name']} — {p['days']} kun — {p['price']} so‘m\n"
+                    text += f"• {p['name']} — {p['days']} kun — {p['price']} so'm\n"
                     mk.add(types.InlineKeyboardButton(
-                        f"{p['name']} ({p['price']} so‘m)",
+                        f"{p['name']} ({p['price']} so'm)",
                         callback_data=f"u:plan:{bot_id}:{p['plan_id']}"
                     ))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"u:main:{bot_id}"))
@@ -1464,12 +1484,12 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 card_holder = get_setting(bot_id, "card_holder") or "—"
                 text = (
                     f"💎 <b>{p['name']}</b>\n\n"
-                    f"📅 Davomiyligi: {p['days']} kun\n"
-                    f"💰 Narxi: <b>{p['price']}</b> so‘m\n\n"
-                    f"💳 <b>To‘lov kartasi:</b>\n"
-                    f"🔢 Raqam: <code>{card_num}</code>\n"
-                    f"👤 Egasi: <b>{card_holder}</b>\n\n"
-                    f"Yuqoridagi kartaga to‘lov qiling, so‘ng «Chek yuborish» ni bosing."
+                    f"📅 {p['days']} kun\n"
+                    f"💰 <b>{p['price']}</b> so'm\n\n"
+                    f"💳 <b>To'lov kartasi:</b>\n"
+                    f"🔢 <code>{card_num}</code>\n"
+                    f"👤 <b>{card_holder}</b>\n\n"
+                    f"To'lov qiling, so'ng «Chek yuborish» ni bosing."
                 )
                 mk = types.InlineKeyboardMarkup()
                 mk.add(types.InlineKeyboardButton("🧾 Chek yuborish", callback_data=f"u:pay:{bot_id}:{pid}"))
@@ -1480,7 +1500,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 pid = int(parts[3])
                 set_state(bot_id, uid, "pay_check", {"plan_id": pid})
                 bot.edit_message_text(
-                    "🧾 To‘lov chekini (rasm yoki fayl) yuboring:",
+                    "🧾 To'lov chekini (rasm yoki fayl) yuboring:",
                     chat_id, msg_id,
                     reply_markup=kb_back(f"u:plans:{bot_id}")
                 )
@@ -1496,22 +1516,15 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
             # ----- ADMIN -----
             elif data.startswith("a:") and not is_admin(bot_id, uid):
-                bot.answer_callback_query(c.id, "⛔ Ruxsat yo‘q", show_alert=True)
+                bot.answer_callback_query(c.id, "⛔ Ruxsat yo'q", show_alert=True)
                 return
 
             elif data.startswith("a:stats:"):
                 text = get_bot_stats_text(bot_id)
-                bot.edit_message_text(
-                    text, chat_id, msg_id, parse_mode="HTML",
-                    reply_markup=kb_back(f"a:main:{bot_id}")
-                )
+                bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=kb_back(f"a:main:{bot_id}"))
 
             elif data.startswith("a:main:"):
-                bot.edit_message_text(
-                    "🔐 <b>ADMIN PANEL</b>",
-                    chat_id, msg_id, parse_mode="HTML",
-                    reply_markup=kb_admin_main(bot_id)
-                )
+                bot.edit_message_text("🔐 <b>ADMIN PANEL</b>", chat_id, msg_id, parse_mode="HTML", reply_markup=kb_admin_main(bot_id))
 
             elif data.startswith("a:addmovie:"):
                 set_state(bot_id, uid, "add_type")
@@ -1526,11 +1539,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             elif data.startswith("a:mtype:"):
                 mtype = parts[3]
                 set_state(bot_id, uid, "add_video", {"type": mtype})
-                bot.edit_message_text(
-                    "📹 Videoni yuboring:",
-                    chat_id, msg_id,
-                    reply_markup=kb_back(f"a:main:{bot_id}")
-                )
+                bot.edit_message_text("📹 Videoni yuboring:", chat_id, msg_id, reply_markup=kb_back(f"a:main:{bot_id}"))
 
             elif data.startswith("a:movies:"):
                 page = int(parts[3]) if len(parts) > 3 else 0
@@ -1543,7 +1552,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             (bot_id, page * 10)
                         )
                         rows = cur.fetchall()
-                text = "📋 <b>Kinolar ro‘yxati</b>\n\n"
+                text = "📋 <b>Kinolar ro'yxati</b>\n\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 for r in rows:
                     t = "💎" if r["movie_type"] == "pro" else "⭐"
@@ -1557,7 +1566,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                     for row in pag.keyboard:
                         mk.add(*row)
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:main:{bot_id}"))
-                bot.edit_message_text(text or "Bo‘sh", chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
+                bot.edit_message_text(text or "Bo'sh", chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("a:mview:"):
                 mid = int(parts[3])
@@ -1572,18 +1581,18 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                     f"🎬 <b>{r['name']}</b>\n"
                     f"🔢 Kod: <code>{r['code']}</code>\n"
                     f"⭐ Turi: {r['movie_type']}\n"
-                    f"👁 Ko‘rishlar: {r['views']}\n"
+                    f"👁 Ko'rishlar: {r['views']}\n"
                     f"📅 {r['created_at']}"
                 )
                 mk = types.InlineKeyboardMarkup()
-                mk.add(types.InlineKeyboardButton("🗑 O‘chirish", callback_data=f"a:mdel:{bot_id}:{mid}"))
+                mk.add(types.InlineKeyboardButton("🗑 O'chirish", callback_data=f"a:mdel:{bot_id}:{mid}"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:movies:{bot_id}:0"))
                 bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("a:mdel:"):
                 mid = int(parts[3])
                 bot.edit_message_text(
-                    "Haqiqatan o‘chirasizmi?",
+                    "Haqiqatan o'chirasizmi?",
                     chat_id, msg_id,
                     reply_markup=kb_confirm(f"a:mdelok:{bot_id}:{mid}", f"a:mview:{bot_id}:{mid}")
                 )
@@ -1593,25 +1602,16 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM movies WHERE movie_id=%s AND bot_id=%s", (mid, bot_id))
-                bot.edit_message_text(
-                    "✅ Kino o‘chirildi.",
-                    chat_id, msg_id,
-                    reply_markup=kb_back(f"a:movies:{bot_id}:0")
-                )
+                bot.edit_message_text("✅ Kino o'chirildi.", chat_id, msg_id, reply_markup=kb_back(f"a:movies:{bot_id}:0"))
 
             elif data.startswith("a:delmovie:"):
                 set_state(bot_id, uid, "del_code")
-                bot.edit_message_text(
-                    "🗑 O‘chirish uchun kino kodini yuboring:",
-                    chat_id, msg_id,
-                    reply_markup=kb_back(f"a:main:{bot_id}")
-                )
+                bot.edit_message_text("🗑 O'chirish uchun kino kodini yuboring:", chat_id, msg_id, reply_markup=kb_back(f"a:main:{bot_id}"))
 
             elif data.startswith("a:broadcast:"):
                 set_state(bot_id, uid, "broadcast")
                 bot.edit_message_text(
-                    "📢 Barcha foydalanuvchilarga yubormoqchi bo‘lgan xabarni yuboring\n"
-                    "(text, photo, video, document va boshqalar):",
+                    "📢 Barchaga yubormoqchi bo'lgan xabarni yuboring:",
                     chat_id, msg_id,
                     reply_markup=kb_back(f"a:main:{bot_id}")
                 )
@@ -1619,8 +1619,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             elif data.startswith("a:addch:"):
                 set_state(bot_id, uid, "add_channel")
                 bot.edit_message_text(
-                    "📢 Kanaldan biror xabarni shu botga forward qiling\n"
-                    "yoki tashqi link (Instagram va h.k.) yuboring:",
+                    "📢 Kanaldan xabarni forward qiling yoki link yuboring:",
                     chat_id, msg_id,
                     reply_markup=kb_back(f"a:main:{bot_id}")
                 )
@@ -1655,14 +1654,14 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                     return
                 text = f"📢 {r['title'] or r['username']}\nTuri: {r['channel_type']}\nURL: {r['url'] or '-'}"
                 mk = types.InlineKeyboardMarkup()
-                mk.add(types.InlineKeyboardButton("🗑 O‘chirish", callback_data=f"a:chdel:{bot_id}:{cid}"))
+                mk.add(types.InlineKeyboardButton("🗑 O'chirish", callback_data=f"a:chdel:{bot_id}:{cid}"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:chs:{bot_id}:0"))
                 bot.edit_message_text(text, chat_id, msg_id, reply_markup=mk)
 
             elif data.startswith("a:chdel:"):
                 cid = int(parts[3])
                 bot.edit_message_text(
-                    "O‘chirasizmi?",
+                    "O'chirasizmi?",
                     chat_id, msg_id,
                     reply_markup=kb_confirm(f"a:chdelok:{bot_id}:{cid}", f"a:chs:{bot_id}:0")
                 )
@@ -1672,7 +1671,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM channels WHERE channel_id=%s AND bot_id=%s", (cid, bot_id))
-                bot.edit_message_text("✅ O‘chirildi", chat_id, msg_id, reply_markup=kb_back(f"a:chs:{bot_id}:0"))
+                bot.edit_message_text("✅ O'chirildi", chat_id, msg_id, reply_markup=kb_back(f"a:chs:{bot_id}:0"))
 
             elif data.startswith("a:plans:"):
                 with db() as conn:
@@ -1682,27 +1681,24 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 text = "💎 <b>Tariflar</b>\n\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 for p in plans:
-                    text += f"• {p['name']} — {p['days']}k — {p['price']} so‘m\n"
+                    text += f"• {p['name']} — {p['days']}k — {p['price']} so'm\n"
                     mk.add(types.InlineKeyboardButton(
                         f"🗑 {p['name']}", callback_data=f"a:plandel:{bot_id}:{p['plan_id']}"
                     ))
-                mk.add(types.InlineKeyboardButton("➕ Tarif qo‘shish", callback_data=f"a:planadd:{bot_id}"))
+                mk.add(types.InlineKeyboardButton("➕ Tarif qo'shish", callback_data=f"a:planadd:{bot_id}"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:main:{bot_id}"))
                 bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("a:planadd:"):
                 set_state(bot_id, uid, "plan_name")
-                bot.edit_message_text(
-                    "💎 Tarif nomini yuboring (masalan: 1 kun):",
-                    chat_id, msg_id, reply_markup=kb_back(f"a:plans:{bot_id}")
-                )
+                bot.edit_message_text("💎 Tarif nomini yuboring:", chat_id, msg_id, reply_markup=kb_back(f"a:plans:{bot_id}"))
 
             elif data.startswith("a:plandel:"):
                 pid = int(parts[3])
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM plans WHERE plan_id=%s AND bot_id=%s", (pid, bot_id))
-                bot.answer_callback_query(c.id, "O‘chirildi")
+                bot.answer_callback_query(c.id, "O'chirildi")
                 c.data = f"a:plans:{bot_id}"
                 m_callback(c)
 
@@ -1713,34 +1709,30 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         owner = cur.fetchone()["owner_id"]
                         cur.execute("SELECT user_id FROM bot_admins WHERE bot_id=%s", (bot_id,))
                         ads = cur.fetchall()
-                text = "👥 <b>Adminlar</b>\n\n"
+                text = f"👥 <b>Adminlar</b>\n\n👤 Owner: {owner}\n"
                 mk = types.InlineKeyboardMarkup(row_width=1)
-                text += f"👤 Owner: {owner}\n"
                 for a in ads:
                     if a["user_id"] != owner:
                         mk.add(types.InlineKeyboardButton(
                             f"👤 {a['user_id']}", callback_data=f"a:admindel:{bot_id}:{a['user_id']}"
                         ))
-                mk.add(types.InlineKeyboardButton("➕ Admin qo‘shish", callback_data=f"a:adminadd:{bot_id}"))
+                mk.add(types.InlineKeyboardButton("➕ Admin qo'shish", callback_data=f"a:adminadd:{bot_id}"))
                 mk.add(types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:main:{bot_id}"))
                 bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
 
             elif data.startswith("a:adminadd:"):
                 set_state(bot_id, uid, "admin_add")
-                bot.edit_message_text(
-                    "👤 Yangi admin Telegram ID sini yuboring:",
-                    chat_id, msg_id, reply_markup=kb_back(f"a:admins:{bot_id}")
-                )
+                bot.edit_message_text("👤 Yangi admin Telegram ID sini yuboring:", chat_id, msg_id, reply_markup=kb_back(f"a:admins:{bot_id}"))
 
             elif data.startswith("a:admindel:"):
                 aid = int(parts[3])
                 if is_owner(bot_id, aid):
-                    bot.answer_callback_query(c.id, "Ownerni o‘chirib bo‘lmaydi", show_alert=True)
+                    bot.answer_callback_query(c.id, "Ownerni o'chirib bo'lmaydi", show_alert=True)
                     return
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("DELETE FROM bot_admins WHERE bot_id=%s AND user_id=%s", (bot_id, aid))
-                bot.answer_callback_query(c.id, "O‘chirildi")
+                bot.answer_callback_query(c.id, "O'chirildi")
                 c.data = f"a:admins:{bot_id}"
                 m_callback(c)
 
@@ -1754,23 +1746,23 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 card_holder = get_setting(bot_id, "card_holder") or "—"
                 text = (
                     f"⚙️ <b>SOZLAMALAR</b>\n\n"
-                    f"💎 PRO tizimi: {pro}\n"
-                    f"📺 Kinolar kanali: {mch}\n"
-                    f"📢 Majburiy obuna: {fsub}\n"
-                    f"💳 To‘lovlar: {pay}\n"
-                    f"🔔 Admin bildirishnomalari: {notif}\n\n"
-                    f"💳 <b>To‘lov kartasi</b>\n"
-                    f"🔢 Raqam: <code>{card_num}</code>\n"
-                    f"👤 Egasi: {card_holder}"
+                    f"💎 PRO: {pro}\n"
+                    f"📺 Kanal: {mch}\n"
+                    f"📢 Obuna: {fsub}\n"
+                    f"💳 To'lov: {pay}\n"
+                    f"🔔 Notify: {notif}\n\n"
+                    f"💳 <b>Karta</b>\n"
+                    f"🔢 <code>{card_num}</code>\n"
+                    f"👤 {card_holder}"
                 )
                 mk = types.InlineKeyboardMarkup(row_width=1)
                 mk.add(
                     types.InlineKeyboardButton(f"💎 PRO: {pro}", callback_data=f"a:tog:{bot_id}:pro_enabled"),
                     types.InlineKeyboardButton(f"📺 Kanal: {mch}", callback_data=f"a:tog:{bot_id}:movies_channel_enabled"),
                     types.InlineKeyboardButton(f"📢 Obuna: {fsub}", callback_data=f"a:tog:{bot_id}:forced_sub_enabled"),
-                    types.InlineKeyboardButton(f"💳 To‘lov: {pay}", callback_data=f"a:tog:{bot_id}:payments_enabled"),
+                    types.InlineKeyboardButton(f"💳 To'lov: {pay}", callback_data=f"a:tog:{bot_id}:payments_enabled"),
                     types.InlineKeyboardButton(f"🔔 Notify: {notif}", callback_data=f"a:tog:{bot_id}:admin_notify"),
-                    types.InlineKeyboardButton("💳 Karta qo‘shish / o‘zgartirish", callback_data=f"a:card:{bot_id}"),
+                    types.InlineKeyboardButton("💳 Karta qo'shish", callback_data=f"a:card:{bot_id}"),
                     types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:main:{bot_id}"),
                 )
                 bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=mk)
@@ -1778,9 +1770,8 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             elif data.startswith("a:card:"):
                 set_state(bot_id, uid, "card_number")
                 bot.edit_message_text(
-                    "💳 <b>Karta raqamini</b> yuboring:\n\n"
-                    "Masalan: <code>8600123456789012</code>",
-                    chat_id, msg_id, parse_mode="HTML",
+                    "💳 Karta raqamini yuboring (faqat raqamlar):",
+                    chat_id, msg_id,
                     reply_markup=kb_back(f"a:settings:{bot_id}")
                 )
 
@@ -1794,8 +1785,9 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             elif data.startswith("a:mch:"):
                 set_state(bot_id, uid, "mch_url")
                 bot.edit_message_text(
-                    "📺 Kinolar kanali URL sini yuboring:\n(masalan: https://t.me/channel)",
-                    chat_id, msg_id, reply_markup=kb_back(f"a:main:{bot_id}")
+                    "📺 Kinolar kanali URL sini yuboring:\nhttps://t.me/channel",
+                    chat_id, msg_id,
+                    reply_markup=kb_back(f"a:main:{bot_id}")
                 )
 
             elif data.startswith("a:payok:"):
@@ -1821,7 +1813,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             (uid, datetime.now().isoformat(), pid)
                         )
                 try:
-                    bot.send_message(pay["user_id"], f"✅ PRO tarif tasdiqlandi!\n📅 Tugash: {end.strftime('%Y-%m-%d')}")
+                    bot.send_message(pay["user_id"], f"✅ PRO tasdiqlandi!\n📅 {end.strftime('%Y-%m-%d')}")
                 except Exception:
                     pass
                 bot.edit_message_text("✅ Tasdiqlandi", chat_id, msg_id)
@@ -1838,7 +1830,7 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                                 (uid, datetime.now().isoformat(), pid)
                             )
                             try:
-                                bot.send_message(pay["user_id"], "❌ To‘lovingiz rad etildi.")
+                                bot.send_message(pay["user_id"], "❌ To'lovingiz rad etildi.")
                             except Exception:
                                 pass
                 bot.edit_message_text("❌ Rad etildi", chat_id, msg_id)
@@ -1850,8 +1842,10 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
             except Exception:
                 pass
 
-    @bot.message_handler(content_types=["text", "photo", "video", "document", "audio", "voice", "sticker", "animation"],
-                         func=lambda m: get_state(bot_id, m.from_user.id)[0] is not None)
+    @bot.message_handler(
+        content_types=["text", "photo", "video", "document", "audio", "voice", "sticker", "animation"],
+        func=lambda m: get_state(bot_id, m.from_user.id)[0] is not None
+    )
     def m_state(m: types.Message):
         uid = m.from_user.id
         state, data = get_state(bot_id, uid)
@@ -1870,7 +1864,6 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         """, (bot_id, f"%{q}%", f"%{q}%"))
                         rows = cur.fetchall()
                         cur.execute("UPDATE users SET searches=searches+1 WHERE bot_id=%s AND user_id=%s", (bot_id, uid))
-                log_stat(bot_id, "search", uid, q)
                 clear_state(bot_id, uid)
                 if not rows:
                     bot.reply_to(m, "❌ Kino topilmadi.", reply_markup=kb_back(f"u:main:{bot_id}"))
@@ -1887,20 +1880,15 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
 
             elif state == "premium_amount":
                 try:
-                    amount = int(m.text.strip().replace(" ", "").replace(",", ""))
+                    amount = int((m.text or "").strip().replace(" ", "").replace(",", ""))
                     if amount < 1000:
-                        bot.reply_to(m, "❌ Minimal summa 1000 so‘m. Qayta yuboring.")
+                        bot.reply_to(m, "❌ Minimal 1000 so'm.")
                         return
-                except ValueError:
-                    bot.reply_to(m, "❌ Raqam yuboring (masalan: 50000).")
+                except (ValueError, TypeError):
+                    bot.reply_to(m, "❌ Raqam yuboring.")
                     return
                 set_state(bot_id, uid, "premium_check", {"amount": amount})
-                bot.reply_to(
-                    m,
-                    f"💰 Summa: <b>{amount}</b> so‘m\n\n"
-                    "🧾 Endi to‘lov chekini (rasm yoki fayl) yuboring:",
-                    parse_mode="HTML"
-                )
+                bot.reply_to(m, f"💰 Summa: <b>{amount}</b> so'm\n\n🧾 Chekni yuboring:", parse_mode="HTML")
 
             elif state == "premium_check":
                 file_id = None
@@ -1915,7 +1903,8 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 with db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
                         cur.execute(
-                            "INSERT INTO payments (bot_id, user_id, plan_id, amount, check_file_id, status) VALUES (%s, %s, NULL, %s, %s, 'pending') RETURNING payment_id",
+                            "INSERT INTO payments (bot_id, user_id, plan_id, amount, check_file_id, status) "
+                            "VALUES (%s, %s, NULL, %s, %s, 'pending') RETURNING payment_id",
                             (bot_id, uid, amount, file_id)
                         )
                         pay_id = cur.fetchone()["payment_id"]
@@ -1925,17 +1914,13 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         admins = [r["user_id"] for r in cur.fetchall()]
                         admins.append(owner)
                 clear_state(bot_id, uid)
-                bot.reply_to(m, "✅ Chek yuborildi. Admin tasdiqlashini kuting.")
+                bot.reply_to(m, "✅ Chek yuborildi.")
                 mk = types.InlineKeyboardMarkup(row_width=2)
                 mk.add(
                     types.InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"a:payok:{bot_id}:{pay_id}"),
                     types.InlineKeyboardButton("❌ Rad etish", callback_data=f"a:payno:{bot_id}:{pay_id}"),
                 )
-                text = (
-                    f"💳 <b>Yangi PREMIUM to‘lov</b> (kanaldan)\n\n"
-                    f"👤 User: {uid}\n"
-                    f"💰 Summa: {amount} so‘m"
-                )
+                text = f"💳 <b>Yangi PREMIUM to'lov</b>\n\n👤 {uid}\n💰 {amount} so'm"
                 for aid in set(admins):
                     try:
                         if m.photo:
@@ -1959,26 +1944,24 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 bot.reply_to(m, "🎬 Kino nomini yuboring:")
 
             elif state == "add_name":
-                data["name"] = m.text.strip()
+                data["name"] = (m.text or "").strip()
                 set_state(bot_id, uid, "add_code", data)
                 bot.reply_to(m, "🔢 Kino kodini yuboring (unique):")
 
             elif state == "add_code":
-                code = m.text.strip()
+                code = (m.text or "").strip()
                 with db() as conn:
                     with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT 1 FROM movies WHERE bot_id=%s AND code=%s", (bot_id, code)
-                        )
+                        cur.execute("SELECT 1 FROM movies WHERE bot_id=%s AND code=%s", (bot_id, code))
                         if cur.fetchone():
-                            bot.reply_to(m, "❌ Bu kod allaqachon mavjud. Boshqa kod yuboring.")
+                            bot.reply_to(m, "❌ Bu kod mavjud. Boshqa kod yuboring.")
                             return
                 data["code"] = code
                 set_state(bot_id, uid, "add_caption", data)
                 bot.reply_to(m, "📝 Caption yuboring (yoki - deb yozing):")
 
             elif state == "add_caption":
-                caption = m.text.strip() if m.text != "-" else ""
+                caption = (m.text or "").strip() if m.text != "-" else ""
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute("""
@@ -1988,31 +1971,28 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                 clear_state(bot_id, uid)
                 mk = types.InlineKeyboardMarkup()
                 mk.add(
-                    types.InlineKeyboardButton("➕ Yana qo‘shish", callback_data=f"a:addmovie:{bot_id}"),
+                    types.InlineKeyboardButton("➕ Yana qo'shish", callback_data=f"a:addmovie:{bot_id}"),
                     types.InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:main:{bot_id}"),
                 )
-                bot.reply_to(m, "✅ Kino muvaffaqiyatli qo‘shildi!", reply_markup=mk)
+                bot.reply_to(m, "✅ Kino qo'shildi!", reply_markup=mk)
 
             elif state == "del_code":
-                code = m.text.strip()
+                code = (m.text or "").strip()
                 with db() as conn:
                     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                        cur.execute(
-                            "SELECT movie_id, name FROM movies WHERE bot_id=%s AND code=%s",
-                            (bot_id, code)
-                        )
+                        cur.execute("SELECT movie_id, name FROM movies WHERE bot_id=%s AND code=%s", (bot_id, code))
                         r = cur.fetchone()
                 clear_state(bot_id, uid)
                 if not r:
                     bot.reply_to(m, "❌ Kino topilmadi.", reply_markup=kb_back(f"a:main:{bot_id}"))
                     return
                 mk = kb_confirm(f"a:mdelok:{bot_id}:{r['movie_id']}", f"a:main:{bot_id}")
-                bot.reply_to(m, f"🎬 {r['name']}\n🔢 {code}\n\nO‘chirasizmi?", reply_markup=mk)
+                bot.reply_to(m, f"🎬 {r['name']}\n🔢 {code}\n\nO'chirasizmi?", reply_markup=mk)
 
             elif state == "broadcast":
                 set_state(bot_id, uid, "broadcast_confirm", {"msg_id": m.message_id, "chat_id": m.chat.id})
                 mk = kb_confirm(f"a:bcok:{bot_id}", f"a:main:{bot_id}")
-                bot.reply_to(m, "📢 Ushbu xabarni barcha foydalanuvchilarga yuboraymi?", reply_markup=mk)
+                bot.reply_to(m, "📢 Barchaga yuboraymi?", reply_markup=mk)
 
             elif state == "add_channel":
                 if m.forward_from_chat and m.forward_from_chat.type == "channel":
@@ -2029,20 +2009,11 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                                     VALUES (%s, %s, %s, %s, 'public', %s)
                                 """, (bot_id, chat_id_str, username, title, url))
                         clear_state(bot_id, uid)
-                        bot.reply_to(m, f"✅ Ommaviy kanal qo‘shildi: {title}", reply_markup=kb_back(f"a:main:{bot_id}"))
+                        bot.reply_to(m, f"✅ Kanal qo'shildi: {title}", reply_markup=kb_back(f"a:main:{bot_id}"))
                     else:
-                        set_state(bot_id, uid, "add_channel_invite", {
-                            "chat_id": chat_id_str,
-                            "title": title
-                        })
-                        bot.reply_to(
-                            m,
-                            f"🔒 <b>Maxfiy kanal:</b> {title}\n\n"
-                            "Endi shu kanal uchun <b>invite link</b> yuboring.\n\n"
-                            "Masalan: <code>https://t.me/+AbCdEfGhIjK</code>",
-                            parse_mode="HTML"
-                        )
-                elif m.text and (m.text.startswith("http") or "t.me/" in m.text.lower() or "instagram" in m.text.lower()):
+                        set_state(bot_id, uid, "add_channel_invite", {"chat_id": chat_id_str, "title": title})
+                        bot.reply_to(m, f"🔒 {title}\n\nEndi invite link yuboring:")
+                elif m.text and (m.text.startswith("http") or "t.me/" in m.text.lower()):
                     url = m.text.strip()
                     with db() as conn:
                         with conn.cursor() as cur:
@@ -2051,14 +2022,14 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                                 VALUES (%s, %s, 'external', %s)
                             """, (bot_id, url, url))
                     clear_state(bot_id, uid)
-                    bot.reply_to(m, "✅ Link qo‘shildi.", reply_markup=kb_back(f"a:main:{bot_id}"))
+                    bot.reply_to(m, "✅ Link qo'shildi.", reply_markup=kb_back(f"a:main:{bot_id}"))
                 else:
-                    bot.reply_to(m, "Kanal xabarini forward qiling yoki link yuboring.")
+                    bot.reply_to(m, "Kanal forward qiling yoki link yuboring.")
 
             elif state == "add_channel_invite":
                 url = (m.text or "").strip()
                 if not url or ("t.me/" not in url and "telegram.me/" not in url):
-                    bot.reply_to(m, "❌ To‘g‘ri invite link yuboring")
+                    bot.reply_to(m, "❌ To'g'ri invite link yuboring")
                     return
                 with db() as conn:
                     with conn.cursor() as cur:
@@ -2067,31 +2038,27 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             VALUES (%s, %s, %s, 'private', %s)
                         """, (bot_id, data.get("chat_id"), data.get("title", "Maxfiy kanal"), url))
                 clear_state(bot_id, uid)
-                bot.reply_to(
-                    m,
-                    f"✅ Maxfiy kanal qo‘shildi!\n🔒 {data.get('title')}\nLink: {url}",
-                    reply_markup=kb_back(f"a:main:{bot_id}")
-                )
+                bot.reply_to(m, f"✅ Maxfiy kanal qo'shildi!\nLink: {url}", reply_markup=kb_back(f"a:main:{bot_id}"))
 
             elif state == "plan_name":
-                data["name"] = m.text.strip()
+                data["name"] = (m.text or "").strip()
                 set_state(bot_id, uid, "plan_days", data)
                 bot.reply_to(m, "📅 Kunlar sonini yuboring (masalan: 30):")
 
             elif state == "plan_days":
                 try:
-                    days = int(m.text.strip())
-                except ValueError:
+                    days = int((m.text or "").strip())
+                except (ValueError, TypeError):
                     bot.reply_to(m, "Raqam yuboring.")
                     return
                 data["days"] = days
                 set_state(bot_id, uid, "plan_price", data)
-                bot.reply_to(m, "💰 Narxni so‘mda yuboring (masalan: 50000):")
+                bot.reply_to(m, "💰 Narxni so'mda yuboring:")
 
             elif state == "plan_price":
                 try:
-                    price = int(m.text.strip().replace(" ", ""))
-                except ValueError:
+                    price = int((m.text or "").strip().replace(" ", ""))
+                except (ValueError, TypeError):
                     bot.reply_to(m, "Raqam yuboring.")
                     return
                 with db() as conn:
@@ -2101,67 +2068,58 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                             (bot_id, data["name"], data["days"], price)
                         )
                 clear_state(bot_id, uid)
-                bot.reply_to(m, "✅ Tarif qo‘shildi!", reply_markup=kb_back(f"a:plans:{bot_id}"))
+                bot.reply_to(m, "✅ Tarif qo'shildi!", reply_markup=kb_back(f"a:plans:{bot_id}"))
 
             elif state == "admin_add":
                 try:
-                    aid = int(m.text.strip())
-                except ValueError:
-                    bot.reply_to(m, "Noto‘g‘ri ID.")
+                    aid = int((m.text or "").strip())
+                except (ValueError, TypeError):
+                    bot.reply_to(m, "Noto'g'ri ID.")
                     return
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "INSERT INTO bot_admins (bot_id, user_id, permissions, added_by) VALUES (%s, %s, 'full', %s) ON CONFLICT DO NOTHING",
+                            "INSERT INTO bot_admins (bot_id, user_id, permissions, added_by) "
+                            "VALUES (%s, %s, 'full', %s) ON CONFLICT DO NOTHING",
                             (bot_id, aid, uid)
                         )
                 clear_state(bot_id, uid)
-                bot.reply_to(m, f"✅ Admin qo‘shildi: {aid}", reply_markup=kb_back(f"a:admins:{bot_id}"))
+                bot.reply_to(m, f"✅ Admin qo'shildi: {aid}", reply_markup=kb_back(f"a:admins:{bot_id}"))
 
             elif state == "mch_url":
-                url = m.text.strip()
-                set_setting(bot_id, movies_channel_url=url)
+                set_setting(bot_id, movies_channel_url=(m.text or "").strip())
                 set_state(bot_id, uid, "mch_name")
                 bot.reply_to(m, "📺 Kanal nomini yuboring:")
 
             elif state == "mch_name":
-                set_setting(bot_id, movies_channel_name=m.text.strip())
+                set_setting(bot_id, movies_channel_name=(m.text or "").strip())
                 set_state(bot_id, uid, "mch_cap")
                 bot.reply_to(m, "📝 Caption yuboring:")
 
             elif state == "mch_cap":
-                set_setting(bot_id, movies_channel_caption=m.text.strip())
+                set_setting(bot_id, movies_channel_caption=(m.text or "").strip())
                 clear_state(bot_id, uid)
                 bot.reply_to(m, "✅ Kinolar kanali sozlandi!", reply_markup=kb_back(f"a:main:{bot_id}"))
 
             elif state == "card_number":
                 num = (m.text or "").strip().replace(" ", "")
                 if not num.isdigit() or len(num) < 12:
-                    bot.reply_to(m, "❌ To‘g‘ri karta raqamini yuboring (faqat raqam, kamida 12 ta).")
+                    bot.reply_to(m, "❌ To'g'ri karta raqamini yuboring.")
                     return
                 set_state(bot_id, uid, "card_holder", {"card_number": num})
-                bot.reply_to(
-                    m,
-                    f"✅ Karta: <code>{num}</code>\n\n"
-                    "👤 Endi <b>karta egasining ism familiyasini</b> yuboring:\n"
-                    "Masalan: <i>Ali Valiyev</i>",
-                    parse_mode="HTML"
-                )
+                bot.reply_to(m, f"✅ Karta: <code>{num}</code>\n\n👤 Endi karta egasining ism familiyasini yuboring:", parse_mode="HTML")
 
             elif state == "card_holder":
                 name = (m.text or "").strip()
                 if len(name) < 3:
-                    bot.reply_to(m, "❌ Ism familiyani to‘liq yozing.")
+                    bot.reply_to(m, "❌ Ism familiyani to'liq yozing.")
                     return
                 num = data.get("card_number", "")
                 set_setting(bot_id, card_number=num, card_holder=name)
                 clear_state(bot_id, uid)
                 bot.reply_to(
                     m,
-                    f"✅ <b>Karta saqlandi!</b>\n\n"
-                    f"🔢 Raqam: <code>{num}</code>\n"
-                    f"👤 Egasi: <b>{name}</b>\n\n"
-                    "Endi foydalanuvchilar tarif tanlaganda shu ma’lumot chiqadi.",
+                    f"✅ <b>Karta saqlandi!</b>\n\n🔢 <code>{num}</code>\n👤 <b>{name}</b>",
                     parse_mode="HTML",
                     reply_markup=kb_back(f"a:settings:{bot_id}")
                 )
@@ -2182,7 +2140,8 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         plan = cur.fetchone()
                         amount = plan["price"] if plan else 0
                         cur.execute(
-                            "INSERT INTO payments (bot_id, user_id, plan_id, amount, check_file_id, status) VALUES (%s, %s, %s, %s, %s, 'pending') RETURNING payment_id",
+                            "INSERT INTO payments (bot_id, user_id, plan_id, amount, check_file_id, status) "
+                            "VALUES (%s, %s, %s, %s, %s, 'pending') RETURNING payment_id",
                             (bot_id, uid, plan_id, amount, file_id)
                         )
                         pay_id = cur.fetchone()["payment_id"]
@@ -2192,18 +2151,13 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
                         admins = [r["user_id"] for r in cur.fetchall()]
                         admins.append(owner)
                 clear_state(bot_id, uid)
-                bot.reply_to(m, "✅ Chek yuborildi. Admin tasdiqlashini kuting.")
+                bot.reply_to(m, "✅ Chek yuborildi.")
                 mk = types.InlineKeyboardMarkup(row_width=2)
                 mk.add(
                     types.InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"a:payok:{bot_id}:{pay_id}"),
                     types.InlineKeyboardButton("❌ Rad etish", callback_data=f"a:payno:{bot_id}:{pay_id}"),
                 )
-                text = (
-                    f"💳 <b>Yangi PRO to‘lov</b>\n\n"
-                    f"👤 User: {uid}\n"
-                    f"💎 Tarif: {plan['name'] if plan else '-'}\n"
-                    f"💰 Summa: {amount} so‘m"
-                )
+                text = f"💳 <b>Yangi PRO to'lov</b>\n\n👤 {uid}\n💎 {plan['name'] if plan else '-'}\n💰 {amount} so'm"
                 for aid in set(admins):
                     try:
                         if m.photo:
@@ -2216,36 +2170,39 @@ def register_movie_handlers(bot: telebot.TeleBot, bot_id: int):
         except Exception as e:
             print(f"State error: {e}\n{traceback.format_exc()}")
             clear_state(bot_id, uid)
-            bot.reply_to(m, "Xatolik yuz berdi. Qayta urinib ko‘ring.")
+            bot.reply_to(m, f"❌ Xatolik: {str(e)[:100]}")
 
     @bot.callback_query_handler(func=lambda c: c.data and c.data.startswith(f"a:bcok:{bot_id}"))
     def do_broadcast(c: types.CallbackQuery):
-        bot.answer_callback_query(c.id)
-        uid = c.from_user.id
-        state, data = get_state(bot_id, uid)
-        if state != "broadcast_confirm":
-            return
-        clear_state(bot_id, uid)
-        src_chat = data["chat_id"]
-        src_msg = data["msg_id"]
-        with db() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT user_id FROM users WHERE bot_id=%s", (bot_id,))
-                users = cur.fetchall()
-        ok = 0
-        err = 0
-        for u in users:
-            try:
-                bot.copy_message(u["user_id"], src_chat, src_msg)
-                ok += 1
-                time.sleep(0.05)
-            except Exception:
-                err += 1
-        bot.edit_message_text(
-            f"📊 Yuborish tugadi.\n\n✅ Yetkazildi: {ok}\n❌ Xato: {err}\n👥 Jami: {ok+err}",
-            c.message.chat.id, c.message.message_id,
-            reply_markup=kb_back(f"a:main:{bot_id}")
-        )
+        try:
+            bot.answer_callback_query(c.id)
+            uid = c.from_user.id
+            state, data = get_state(bot_id, uid)
+            if state != "broadcast_confirm":
+                return
+            clear_state(bot_id, uid)
+            src_chat = data["chat_id"]
+            src_msg = data["msg_id"]
+            with db() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT user_id FROM users WHERE bot_id=%s", (bot_id,))
+                    users = cur.fetchall()
+            ok = 0
+            err = 0
+            for u in users:
+                try:
+                    bot.copy_message(u["user_id"], src_chat, src_msg)
+                    ok += 1
+                    time.sleep(0.05)
+                except Exception:
+                    err += 1
+            bot.edit_message_text(
+                f"📊 Tugadi.\n\n✅ {ok} | ❌ {err}",
+                c.message.chat.id, c.message.message_id,
+                reply_markup=kb_back(f"a:main:{bot_id}")
+            )
+        except Exception as e:
+            print(f"do_broadcast error: {e}")
 
 def get_bot_stats_text(bot_id: int) -> str:
     with db() as conn:
@@ -2278,7 +2235,7 @@ def get_bot_stats_text(bot_id: int) -> str:
             active = c.fetchone()[0]
     return (
         f"📊 <b>STATISTIKA</b>\n\n"
-        f"👥 Jami foydalanuvchilar: {total_u}\n"
+        f"👥 Jami: {total_u}\n"
         f"🟢 Faol (7 kun): {active}\n"
         f"🎬 Jami kinolar: {total_m}\n"
         f"⭐ Oddiy: {normal_m}\n"
@@ -2287,7 +2244,7 @@ def get_bot_stats_text(bot_id: int) -> str:
         f"📺 Kanallar: {chs}\n"
         f"👨‍💼 Adminlar: {ads}\n"
         f"🔎 Qidiruvlar: {searches}\n"
-        f"▶️ Ko‘rishlar: {views}\n"
+        f"▶️ Ko'rishlar: {views}\n"
         f"💾 Saqlangan: {saved}"
     )
 
@@ -2295,7 +2252,7 @@ def get_bot_stats_text(bot_id: int) -> str:
 
 @app.route("/")
 def index():
-    return "🎬 Kino Bot Builder is running (Flask webhook + Supabase)", 200
+    return "🎬 Kino Bot Builder is running", 200
 
 @app.route("/health")
 def health():
@@ -2339,7 +2296,7 @@ def setup_webhooks():
     global builder_bot
     base = WEBHOOK_BASE or os.environ.get("RENDER_EXTERNAL_URL", "")
     if not base:
-        print("⚠️ WEBHOOK_BASE / RENDER_EXTERNAL_URL not set — webhooks not configured")
+        print("⚠️ WEBHOOK_BASE not set")
         return
     try:
         builder_bot.remove_webhook()
@@ -2350,20 +2307,30 @@ def setup_webhooks():
     except Exception as e:
         print(f"Builder webhook set error: {e}")
 
+_bootstrapped = False
+
 def bootstrap():
-    global builder_bot
-    print("🎬 Kino Bot Builder (Flask + Supabase) ishga tushmoqda...")
+    global builder_bot, _bootstrapped
+    if _bootstrapped:
+        return
+    _bootstrapped = True
+    print("🎬 Kino Bot Builder ishga tushmoqda...")
     try:
         init_pool()
         init_db()
     except Exception as e:
         print(f"❌ DB ulanish xatosi: {e}")
-        print("Supabase dashboarddan Database password ni tekshiring / qayta o‘rnating.")
-        print("Env: DB_PASSWORD, DB_HOST, DB_USER ...")
+        print("Env: DB_PASSWORD, DB_HOST, DB_USER tekshiring")
     builder_bot = telebot.TeleBot(BUILDER_TOKEN, threaded=False)
     register_builder_handlers(builder_bot)
-    restart_active_bots()
-    setup_webhooks()
+    try:
+        restart_active_bots()
+    except Exception as e:
+        print(f"restart_active_bots error: {e}")
+    try:
+        setup_webhooks()
+    except Exception as e:
+        print(f"setup_webhooks error: {e}")
     print("✅ Bootstrap complete")
 
 bootstrap()
